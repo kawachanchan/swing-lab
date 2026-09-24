@@ -67,11 +67,9 @@ details.tips ul{margin:8px 0 0;padding-left:1.2em}
 .stage canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:manipulation}
 .scrub{position:relative;padding-top:4px}
 .scrub input{width:100%;accent-color:var(--accent)}
-.ticks{position:relative;height:32px;font-size:11px;color:var(--muted)}
-.ticks span{position:absolute;transform:translateX(-50%);white-space:nowrap}
-.ticks span.lo{top:14px}
-.ticks span.lo::before{height:20px;margin-top:-14px}
-.ticks span::before{content:"";display:block;width:2px;height:6px;background:var(--muted);margin:0 auto 1px}
+.ticks{position:relative;height:24px;font-size:11px;line-height:14px;color:var(--muted)}
+.ticks .tk{position:absolute;top:0;width:2px;height:6px;background:var(--muted);margin-left:-1px}
+.ticks .lb{position:absolute;white-space:nowrap}
 .hint{font-size:13px;color:var(--muted)}
 .progress{flex:1;min-width:120px;height:8px;background:var(--surface-2);border-radius:99px;overflow:hidden}
 .progress div{height:100%;width:0;background:var(--accent);transition:width .15s}
@@ -112,6 +110,9 @@ details.tips ul{margin:8px 0 0;padding-left:1.2em}
 .hist .open{flex:1;display:flex;gap:12px;align-items:center;text-align:left;background:none;border:0;color:inherit;font:inherit;cursor:pointer;padding:0;min-width:0}
 .empty{font-size:13px;color:var(--muted)}
 pre.log{white-space:pre-wrap;word-break:break-all;font-size:11px;max-height:220px;overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:8px;margin:8px 0;color:var(--ink)}
+.flight{margin:0;background:var(--surface-2);border-radius:10px;padding:10px 12px}
+.flight figcaption{font-size:12px;color:var(--muted);letter-spacing:.04em;margin-bottom:4px}
+.flight svg{display:block;width:100%;height:auto}
 footer{font-size:12px;color:var(--muted);text-align:center}
 @media (prefers-reduced-motion: reduce){ .progress div{transition:none} }
 </style>
@@ -208,6 +209,7 @@ footer{font-size:12px;color:var(--muted);text-align:center}
       <div class="metric"><div class="k">テンポ（バック：ダウン）</div><div class="v" id="mTempo">--</div><div class="s">目安は 3：1</div></div>
       <div class="metric"><div class="k">弾道ライン</div><div class="v" id="mTracer" style="font-size:17px">--</div><div class="s" id="mTracerS"></div></div>
     </div>
+    <figure class="flight" id="flightBox"><figcaption>弾道図（横から見た予測）</figcaption><div id="flight"></div></figure>
     <div class="phases" id="phases"></div>
     <ul class="items" id="items"></ul>
     <p class="notes" id="notes"></p>
@@ -231,7 +233,7 @@ const KEYS=['nose','ls','rs','le','re','lw','rw','lh','rh','lk','rk','la','ra'];
 const MP_IDX=[0,11,12,13,14,15,16,23,24,25,26,27,28];
 const KI=Object.fromEntries(KEYS.map((k,i)=>[k,i]));
 const EDGES=[['ls','rs'],['ls','le'],['le','lw'],['rs','re'],['re','rw'],['ls','lh'],['rs','rh'],['lh','rh'],['lh','lk'],['lk','la'],['rh','rk'],['rk','ra']];
-const MAX_FRAMES=360, KEEP=5;
+const MAX_FRAMES=360, KEEP=5, PLAY_RATE=0.3;
 const PHASE_LABEL={address:'アドレス',top:'トップ',impact:'インパクト',finish:'フィニッシュ'};
 const $=id=>document.getElementById(id);
 
@@ -410,6 +412,29 @@ function detectBall(video, f, meta){
   if(!best) return null;
   return {x:best.x/w,y:best.y/h,auto:true,found:true};
 }
+// クラブごとの弾道の目安（最高到達点[m]、一般的なキャリー[yd]）
+const CLUB_FLIGHT={D:{apex:28,carry:210},W3:{apex:26,carry:190},UT:{apex:25,carry:175},I5:{apex:26,carry:165},I7:{apex:27,carry:145},I9:{apex:28,carry:125},PW:{apex:27,carry:110}};
+// 弾道の形（0=打ち出し、1=落下）。最高点は全体の約63%の位置で、落ちるときの方が急になる
+const flightShape=s=>s*(1-s*s*s), FLIGHT_MAX=flightShape(Math.cbrt(0.25));
+function flightOf(rec){ const club=rec.meta.club||'D', fl=CLUB_FLIGHT[club]||CLUB_FLIGHT.D, carryYd=computeCarry(rec.res,club).yd; return {carryYd,D:carryYd*0.9144,apex:fl.apex*clamp(carryYd/fl.carry,0.5,1.2)}; }
+// 映像に重ねる弾道ライン。後方撮影は遠近法で落下地点まで描く。正面撮影は画面の外へ飛んでいく
+function buildTracer(rec){
+  const meta=rec.meta, b=rec.ball, W=meta.vw, H=meta.vh, dir=meta.hand==='R'?1:-1, det=rec.tracer&&rec.tracer.kind==='detected'?rec.tracer.pts:null;
+  if(meta.view!=='dtl'){ return {pts:det&&det.length>=3?extendFace(det,b,meta):estTracer(b,meta),landing:null}; }
+  const fl=flightOf(rec), B={x:b.x*W,y:b.y*H};
+  // カメラは手元の高さにあるとみなし、アドレス時の手元の高さを地平線とする
+  const f0=rec.frames[rec.res.phases.address].p; let horizon=(f0[KI.lw][1]+f0[KI.rw][1])/2*H;
+  if(B.y-horizon<0.12*H) horizon=B.y-0.3*H;
+  const camH=1.0, camBack=3.0, fpx=(B.y-horizon)*camBack/camH;
+  // 打ち出し直後のボールを追えていれば、その左右の向きを使う
+  let side=0; if(det&&det.length>=2){ const l=det[det.length-1]; const dy=(b.y-l.y)*H; if(dy>2) side=clamp((l.x-b.x)*W/dy,-1.5,1.5); }
+  // カメラは飛球線と平行に向いているとみなし、飛球線は画面中央の消失点に向かって細くなる
+  const cx=W/2, Xb=(B.x-cx)*camBack/fpx, lateral=fl.D*0.08*side, pts=[];
+  for(let k=0;k<=60;k++){ const s=k/60, Z=fl.D*s, Y=fl.apex*flightShape(s)/FLIGHT_MAX, X=Xb+lateral*s*s, depth=Z+camBack;
+    pts.push({x:(cx+fpx*X/depth)/W,y:(horizon-fpx*(Y-camH)/depth)/H}); }
+  return {pts,landing:pts[pts.length-1],carryYd:fl.carryYd};
+}
+function extendFace(det,b,meta){ const est=estTracer(b,meta); const last=det[det.length-1]; let j=0,bd=1e9; est.forEach((p,k)=>{ const d=Math.hypot(p.x-last.x,p.y-last.y); if(d<bd){bd=d;j=k;} }); return det.concat(est.slice(j+1)); }
 function estTracer(ball, meta){
   const W=meta.vw,H=meta.vh,dir=meta.hand==='R'?1:-1,B={x:ball.x*W,y:ball.y*H},pts=[];
   if(meta.view==='face'){
@@ -476,34 +501,45 @@ async function checkFiles(list){
   for(const f of list){ try{ const r=await fetchT('mp2/'+f,{method:'HEAD',cache:'no-store'},8000); if(r.status===404) miss.push(f); }catch(e){ log(`確認できず（${e.name==='AbortError'?'応答なし':e.message}）: ${f}`); } }
   if(miss.length){ log('見つからないファイル: '+miss.join(', ')); const er=new Error(`mp2フォルダに必要なファイルがありません（${miss.join('、')}）。GitHubに mp2 フォルダの中身がすべてアップロードされているか確認してください。`); er.missing=true; throw er; }
 }
+// ファイルの実際の大きさ（サーバーが圧縮して送ると content-length が小さくなり、%が100を超えるため固定値を使う）
+const FILE_SIZES={'vision_wasm_internal.wasm':11756954,'vision_wasm_nosimd_internal.wasm':10960242,'pose_landmarker_lite.task':5777162,'pose_landmarker_full.task':9397646};
+const ENGINE_CACHE='swing-lab-engine-v1';
 // 進捗つきダウンロード。20秒データが届かなければ打ち切る
-async function download(url,label){
+async function download(url,label,onProg){
   const ac=new AbortController(); let idle=setTimeout(()=>ac.abort(),20000);
   try{
     const r=await fetch(url,{signal:ac.signal});
     if(!r.ok) throw new Error(r.status===404?`${label}のファイルが見つかりません（${url}）。GitHubに mp2 フォルダの中身がすべてアップロードされているか確認してください。`:`${label}を取得できませんでした（HTTP ${r.status}）`);
     if(/html/.test(r.headers.get('content-type')||'')) throw new Error(`${label}が見つかりません`);
-    const total=+r.headers.get('content-length')||0;
-    if(!r.body||!r.body.getReader){ const buf=new Uint8Array(await r.arrayBuffer()); return buf; }
-    const rd=r.body.getReader(), parts=[]; let got=0, lastLog=0;
+    const total=FILE_SIZES[url.split('/').pop()]||(!r.headers.get('content-encoding')&&+r.headers.get('content-length'))||0;
+    if(!r.body||!r.body.getReader){ const buf=new Uint8Array(await r.arrayBuffer()); onProg&&onProg(buf.length,buf.length); return buf; }
+    const rd=r.body.getReader(), parts=[]; let got=0;
     for(;;){ const {done,value}=await rd.read(); if(done) break; parts.push(value); got+=value.length;
-      clearTimeout(idle); idle=setTimeout(()=>ac.abort(),20000);
-      const pct=total?Math.round(got/total*100):null; setEngine('loading',`${label} ${pct!=null?pct+'%':(got/1048576).toFixed(1)+'MB'}`);
-      if(performance.now()-lastLog>3000){ lastLog=performance.now(); log(`${label} 受信中 ${(got/1048576).toFixed(1)}MB${total?` / ${(total/1048576).toFixed(1)}MB`:''}`); } }
+      clearTimeout(idle); idle=setTimeout(()=>ac.abort(),20000); onProg&&onProg(got,Math.max(total,got)); }
     const out=new Uint8Array(got); let o=0; for(const part of parts){ out.set(part,o); o+=part.length; }
-    log(`${label} 受信完了 ${(got/1048576).toFixed(1)}MB`); return out;
+    onProg&&onProg(got,got); return out;
   }catch(e){ if(e.name==='AbortError') throw new Error(`${label}のダウンロードが20秒以上止まりました。通信環境を確認してページを再読み込みしてください。`); throw e; }
   finally{ clearTimeout(idle); }
 }
-async function modelSource(cx){
-  // mp2/ にモデルファイルがあればダウンロードして使う。無い環境では埋め込み版（Base64）から読み込む
+// 2回目以降は端末に保存したファイルを使う（ダウンロードしない）
+async function cachedDownload(url,label,onProg){
+  const t0=performance.now();
+  try{ if(window.caches){ const c=await caches.open(ENGINE_CACHE); const hit=await c.match(url); if(hit){ const b=new Uint8Array(await hit.arrayBuffer()); if(b.length>1000){ onProg&&onProg(b.length,b.length); log(`${label}: 端末に保存済み（${(b.length/1048576).toFixed(1)}MB、${Math.round(performance.now()-t0)}ms）`); return b; } } } }catch(e){}
+  const b=await download(url,label,onProg);
+  log(`${label}: ダウンロード完了（${(b.length/1048576).toFixed(1)}MB、${((performance.now()-t0)/1000).toFixed(1)}秒）`);
+  try{ if(window.caches){ const c=await caches.open(ENGINE_CACHE); await c.put(url,new Response(b,{headers:{'content-type':'application/octet-stream'}})); } }catch(e){ log('端末への保存はできませんでした（次回もダウンロードします）'); }
+  return b;
+}
+async function modelSource(cx,onProg){
+  // mp2/ にモデルファイルがあればそれを使う。無い環境では埋め込み版（Base64）から読み込む
   const name=cx?'pose_landmarker_full.task':'pose_landmarker_lite.task';
-  try{ const u=await download('mp2/'+name,'モデル'); log('モデル: mp2フォルダのファイルを使用'); return {modelAssetBuffer:u}; }
+  try{ const u=await cachedDownload('mp2/'+name,'モデル',onProg); return {src:{modelAssetBuffer:u},embedded:false}; }
   catch(e){ log('mp2のモデルを使えません: '+e.message); if(/止まりました/.test(e.message)) throw e; }
-  log('モデル: 埋め込み版を使用'); setEngine('loading','モデル（埋め込み版）');
+  log('モデル: 埋め込み版を使用');
   await withTimeout(loadScript('mp2/b64/'+name.replace(/\./g,'_')+'.js'),60000,'モデルを読み込めませんでした。');
   const b=atob(window.__MPB[name]); const u=new Uint8Array(b.length); for(let i=0;i<b.length;i++) u[i]=b.charCodeAt(i); delete window.__MPB[name];
-  return {modelAssetBuffer:u};
+  onProg&&onProg(u.length,u.length);
+  return {src:{modelAssetBuffer:u},embedded:true};
 }
 function setEngine(state,detail){ const e=document.getElementById('engine'); if(!e) return; e.textContent=state==='ready'?'解析エンジン 準備OK':state==='error'?'解析エンジン エラー':`解析エンジン 準備中${detail?'（'+detail+'）':'…'}`; e.className='badge'+(state==='ready'?' ok':state==='error'?' err':''); }
 async function getLandmarker(cx){
@@ -514,13 +550,21 @@ async function getLandmarker(cx){
     const job=(async()=>{
       const t0=performance.now(); log(`解析エンジンを準備中（端末: ${navigator.userAgent}）`);
       const simd=await Vision.FilesetResolver.isSimdSupported();
-      const base=simd?'vision_wasm_internal':'vision_wasm_nosimd_internal'; log(`1/3 エンジン取得（${simd?'SIMD対応':'SIMD非対応'}）`);
-      // 先に進捗つきで取得しておく（ブラウザのキャッシュに入るので、エンジン起動時の読み込みが速くなる）
-      await download(`mp2/wasm/${base}.wasm`,'エンジン');
-      const fs={wasmLoaderPath:new URL(`mp2/wasm/${base}.js`,location.href).href,wasmBinaryPath:new URL(`mp2/wasm/${base}.wasm`,location.href).href};
-      log('2/3 モデル取得'); const src=await modelSource(cx);
-      log('3/3 エンジン起動'); setEngine('loading','起動中');
+      const base=simd?'vision_wasm_internal':'vision_wasm_nosimd_internal'; log(`1/2 エンジンとモデルを取得（${simd?'SIMD対応':'SIMD非対応'}）`);
+      // エンジンとモデルを同時に取得し、合計の進み具合を表示する
+      const prog={e:[0,FILE_SIZES[base+'.wasm']],m:[0,FILE_SIZES[cx?'pose_landmarker_full.task':'pose_landmarker_lite.task']]};
+      const show=()=>{ const got=prog.e[0]+prog.m[0], tot=prog.e[1]+prog.m[1]; const pct=Math.min(99,Math.floor(got/Math.max(1,tot)*100)); setEngine('loading',`ダウンロード ${pct}%・${(got/1048576).toFixed(1)}/${(tot/1048576).toFixed(1)}MB`); };
+      const [wasmBuf,model]=await Promise.all([
+        cachedDownload(`mp2/wasm/${base}.wasm`,'エンジン',(g,t)=>{prog.e=[g,t];show();}),
+        modelSource(cx,(g,t)=>{prog.m=[g,t];show();})
+      ]);
+      const src=model.src;
+      // 取得済みのエンジンをそのまま渡す（二重にダウンロードしない）。埋め込み版の環境では通常の場所から読み込む
+      const wasmPath=model.embedded?new URL(`mp2/wasm/${base}.wasm`,location.href).href:URL.createObjectURL(new Blob([wasmBuf],{type:'application/wasm'}));
+      const fs={wasmLoaderPath:new URL(`mp2/wasm/${base}.js`,location.href).href,wasmBinaryPath:wasmPath};
+      log('2/2 エンジン起動'); setEngine('loading','起動中'); const tStart=performance.now();
       const lm=await withTimeout(Vision.PoseLandmarker.createFromOptions(fs,{baseOptions:{...src,delegate:'CPU'},runningMode:'VIDEO',numPoses:1,minPoseDetectionConfidence:0.5,minPosePresenceConfidence:0.5,minTrackingConfidence:0.5}),45000,'解析エンジンの起動が45秒たっても終わりませんでした（ダウンロードは完了しています）。「詳細ログ」をコピーして送ってください。');
+      log(`エンジン起動 ${((performance.now()-tStart)/1000).toFixed(1)}秒`);
       if(landmarker){ try{landmarker.close();}catch(e){} }
       landmarker=lm; lmCx=cx; log(`解析エンジンの準備完了（${((performance.now()-t0)/1000).toFixed(1)}秒）`); setEngine('ready'); return lm;
     })();
@@ -544,7 +588,7 @@ function seek(v,t){
 const DB={db:null,mem:[]};
 function dbOpen(){ return new Promise(res=>{ try{ const rq=indexedDB.open('swing-lab',1); rq.onupgradeneeded=()=>rq.result.createObjectStore('shots',{keyPath:'id'}); rq.onsuccess=()=>{DB.db=rq.result;res();}; rq.onerror=()=>res(); }catch(e){res();} }); }
 function dbAll(){ if(!DB.db) return Promise.resolve(DB.mem.slice()); return new Promise(res=>{ try{ const rq=DB.db.transaction('shots','readonly').objectStore('shots').getAll(); rq.onsuccess=()=>res(rq.result||[]); rq.onerror=()=>res(DB.mem.slice()); }catch(e){res(DB.mem.slice());} }); }
-function dbPut(r){ DB.mem=DB.mem.filter(x=>x.id!==r.id).concat(r); if(!DB.db) return Promise.resolve(true); return new Promise(res=>{ try{ const tx=DB.db.transaction('shots','readwrite'); tx.objectStore('shots').put(r); tx.oncomplete=()=>res(true); tx.onerror=()=>res(false); tx.onabort=()=>res(false); }catch(e){res(false);} }); }
+function dbPut(r){ if(r&&r._tr){ const {_tr,_trKey,...rest}=r; r=rest; } DB.mem=DB.mem.filter(x=>x.id!==r.id).concat(r); if(!DB.db) return Promise.resolve(true); return new Promise(res=>{ try{ const tx=DB.db.transaction('shots','readwrite'); tx.objectStore('shots').put(r); tx.oncomplete=()=>res(true); tx.onerror=()=>res(false); tx.onabort=()=>res(false); }catch(e){res(false);} }); }
 function dbDel(id){ DB.mem=DB.mem.filter(x=>x.id!==id); if(!DB.db) return Promise.resolve(); return new Promise(res=>{ try{ const tx=DB.db.transaction('shots','readwrite'); tx.objectStore('shots').delete(id); tx.oncomplete=()=>res(); tx.onerror=()=>res(); }catch(e){res();} }); }
 async function saveRecord(rec){ let ok=await dbPut(rec); if(!ok&&rec.video){ delete rec.video; rec.noVideo=true; ok=await dbPut(rec); } const all=(await dbAll()).sort((a,b)=>b.date-a.date); for(const old of all.slice(KEEP)) await dbDel(old.id); }
 
@@ -560,7 +604,7 @@ function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('swing-set
 function setAspect(w,h){ S.ar=w/h; stage.style.aspectRatio=`${w} / ${h}`; stage.style.width=`min(100%, calc(64vh * ${w/h}))`; requestAnimationFrame(()=>{sizeCanvas();draw();}); }
 function contentRect(){ const r=stage.getBoundingClientRect(), ar=S.ar||(9/16); let w=r.width,h=r.height,x=0,y=0; if(w/h>ar){ w=h*ar; x=(r.width-w)/2; } else { h=w/ar; y=(r.height-h)/2; } return {x,y,w,h,full:r}; }
 function sizeCanvas(){ const r=stage.getBoundingClientRect(), d=window.devicePixelRatio||1; ov.width=Math.max(1,Math.round(r.width*d)); ov.height=Math.max(1,Math.round(r.height*d)); octx.setTransform(d,0,0,d,0,0); }
-window.addEventListener('resize',()=>{sizeCanvas();draw();});
+window.addEventListener('resize',()=>{sizeCanvas();draw();renderTicks();});
 
 function framesNow(){ return S.rec?S.rec.frames:[]; }
 function nearestIdx(tm){ const f=framesNow(); if(!f.length) return 0; let lo=0,hi=f.length-1; while(lo<hi){const m=(lo+hi)>>1; if(f[m].tm<tm) lo=m+1; else hi=m;} if(lo>0&&Math.abs(f[lo-1].tm-tm)<Math.abs(f[lo].tm-tm)) lo--; return lo; }
@@ -592,11 +636,16 @@ function drawInner(W,H){
   octx.strokeStyle='rgba(255,255,255,.9)'; octx.lineWidth=lw*0.6; octx.beginPath(); octx.arc(nz.x,nz.y,W*0.035,0,Math.PI*2); octx.stroke();
   // 弾道ライン
   if(i<ph.impact){ drawBall(rec.ball,W,H,lw); }
-  else { const frac=rec.tracer.kind==='detected'?1:clamp((i-ph.impact+1)/Math.max(4,ph.finish-ph.impact),0.08,1); drawTracer(rec.tracer.pts,frac,W,H,lw); }
+  else { const T=tracerCached(rec), end=Math.max(ph.impact+4,fr.length-1), frac=clamp((i-ph.impact+1)/Math.max(4,end-ph.impact),0.06,1);
+    drawTracer(T.pts,frac,W,H,lw);
+    if(T.landing&&frac>=1){ const L={x:T.landing.x*W,y:T.landing.y*H}; octx.save(); octx.strokeStyle=getCss('--tracer'); octx.fillStyle='#fff'; octx.lineWidth=lw*0.8; octx.beginPath(); octx.arc(L.x,L.y,lw*2.2,0,Math.PI*2); octx.fill(); octx.stroke();
+      const fs=Math.max(12,W*0.04); octx.font=`bold ${fs}px ${getComputedStyle(document.body).fontFamily}`; const txt=`約${Math.round(T.carryYd)}Y`, tw=octx.measureText(txt).width, tx=clamp(L.x-tw/2,4,W-tw-4), ty=Math.max(fs+4,L.y-lw*3);
+      octx.fillStyle='rgba(0,0,0,.6)'; octx.fillRect(tx-6,ty-fs,tw+12,fs+8); octx.fillStyle='#fff'; octx.fillText(txt,tx,ty+2); octx.restore(); } }
   // 局面ラベル
   const lab=Object.entries(PHASE_LABEL).find(([k])=>ph[k]===i);
   if(lab){ octx.font=`bold ${Math.max(13,W*0.045)}px ${getComputedStyle(document.body).fontFamily}`; octx.fillStyle='rgba(0,0,0,.6)'; const tw=octx.measureText(lab[1]).width; octx.fillRect(10,10,tw+16,Math.max(13,W*0.045)+12); octx.fillStyle='#fff'; octx.fillText(lab[1],18,10+Math.max(13,W*0.045)+2); }
 }
+function tracerCached(rec){ const key=`${rec.meta.club}|${rec.ball.x}|${rec.ball.y}|${rec.tracer&&rec.tracer.kind}`; if(!rec._tr||rec._trKey!==key){ rec._tr=buildTracer(rec); rec._trKey=key; } return rec._tr; }
 function drawBall(b,W,H,lw){ if(!b) return; octx.fillStyle='#fff'; octx.strokeStyle=getCss('--tracer'); octx.lineWidth=lw*0.7; octx.beginPath(); octx.arc(b.x*W,b.y*H,lw*2,0,Math.PI*2); octx.fill(); octx.stroke(); }
 function drawTracer(pts,frac,W,H,lw){
   if(!pts||pts.length<2) return; const px=pts.map(p=>({x:p.x*W,y:p.y*H})); let tot=0; const seg=[]; for(let k=1;k<px.length;k++){const d=dist(px[k],px[k-1]);seg.push(d);tot+=d;}
@@ -617,7 +666,19 @@ function setSlider(){
 }
 function renderTicks(){
   const t=$('ticks'); t.innerHTML=''; const rec=S.rec; if(!rec) return; const fr=rec.frames, min=+seekEl.min||0, span=Math.max(1e-6,(+seekEl.max||1)-min);
-  for(const [k,l] of Object.entries(PHASE_LABEL)){ const i=rec.res.phases[k]; const v=S.mode==='video'?fr[i].tm:i; const s=document.createElement('span'); s.style.left=`${clamp((v-min)/span,0,1)*100}%`; s.textContent=l; if(t.children.length%2) s.className='lo'; t.appendChild(s); }
+  // スライダーのつまみの幅（左右8px）を考えて、目盛りの位置をつまみの中心に合わせる
+  const cw=t.clientWidth||seekEl.clientWidth||300, inset=8, rowsRight=[];
+  const items=Object.entries(PHASE_LABEL).map(([k,l])=>{ const i=rec.res.phases[k]; const v=S.mode==='video'?fr[i].tm:i; return {l,x:inset+clamp((v-min)/span,0,1)*(cw-2*inset)}; }).sort((a,b)=>a.x-b.x);
+  for(const it of items){
+    const tk=document.createElement('span'); tk.className='tk'; tk.style.left=`${it.x}px`; t.appendChild(tk);
+    const lb=document.createElement('span'); lb.className='lb'; lb.textContent=it.l; t.appendChild(lb);
+    const w=lb.offsetWidth, left=clamp(it.x-w/2,0,Math.max(0,cw-w));
+    // 前のラベルと重なるなら下の段に置く
+    let row=0; while(rowsRight[row]!=null&&rowsRight[row]+6>left) row++;
+    rowsRight[row]=left+w; lb.style.left=`${left}px`; lb.style.top=`${8+row*15}px`;
+    if(row>0){ tk.style.height=`${8+row*15}px`; }
+  }
+  t.style.height=`${8+rowsRight.length*15+2}px`;
 }
 function updateTime(){
   const fr=framesNow();
@@ -627,9 +688,27 @@ function updateTime(){
 }
 function gotoIdx(i){ const fr=framesNow(); if(!fr.length) return; S.cur=clamp(i,0,fr.length-1); if(S.mode==='video'){ vid.pause(); seek(vid,fr[S.cur].tm).then(()=>{seekEl.value=vid.currentTime;updateTime();draw();}); } else { seekEl.value=S.cur; updateTime(); draw(); } }
 
+function renderFlight(rec){
+  const box=$('flight'); if(!rec){ box.innerHTML=''; return; }
+  const fl=flightOf(rec), Wv=360, Hv=170, L=14, R=16, T=24, Bm=28, maxYd=Math.max(100,Math.ceil(fl.carryYd*1.12/50)*50), maxM=Math.max(35,Math.ceil(fl.apex*1.25/10)*10);
+  const X=yd=>L+(Wv-L-R)*yd/maxYd, Y=m=>Hv-Bm-(Hv-Bm-T)*m/maxM;
+  let d=''; for(let k=0;k<=60;k++){ const s=k/60, yd=fl.carryYd*s, m=fl.apex*flightShape(s)/FLIGHT_MAX; d+=(k?'L':'M')+X(yd).toFixed(1)+' '+Y(m).toFixed(1); }
+  let ticks=''; for(let yd=0;yd<=maxYd;yd+=50){ ticks+=`<line x1="${X(yd)}" y1="${Hv-Bm}" x2="${X(yd)}" y2="${Hv-Bm+5}" stroke="var(--muted)"/><text x="${X(yd)}" y="${Hv-Bm+18}" text-anchor="middle" font-size="11" fill="var(--muted)">${yd}Y</text>`; }
+  const ax=X(fl.carryYd*Math.cbrt(0.25)), ay=Y(fl.apex), lx=X(fl.carryYd);
+  box.innerHTML=`<svg viewBox="0 0 ${Wv} ${Hv}" role="img" aria-label="予測弾道：キャリー約${Math.round(fl.carryYd)}ヤード、最高点約${Math.round(fl.apex)}メートル">
+    <line x1="${L}" y1="${Hv-Bm}" x2="${Wv-R}" y2="${Hv-Bm}" stroke="var(--line)" stroke-width="2"/>${ticks}
+    
+    <path d="${d}" fill="none" stroke="var(--tracer)" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="${X(0)}" cy="${Y(0)}" r="4" fill="var(--surface)" stroke="var(--tracer)" stroke-width="2"/>
+    <line x1="${ax}" y1="${ay}" x2="${ax}" y2="${Hv-Bm}" stroke="var(--muted)" stroke-dasharray="3 3"/>
+    <text x="${ax}" y="${ay-8}" text-anchor="middle" font-size="12" fill="var(--ink)">最高点 約${Math.round(fl.apex)}m</text>
+    <circle cx="${lx}" cy="${Hv-Bm}" r="5" fill="var(--tracer)"/>
+    <text x="${Math.min(lx,Wv-R-34)}" y="${Hv-Bm-10}" text-anchor="middle" font-size="13" font-weight="bold" fill="var(--ink)">落下 約${Math.round(fl.carryYd)}Y</text>
+  </svg>`;
+}
 function renderResult(){
   const rec=S.rec;
-  if(!rec){ $('total').textContent='--'; $('grade').textContent='まだ解析していません'; $('advice').textContent='動画を読み込んで「解析する」を押すと結果が表示されます。'; ['mCarry','mHead','mHand','mTempo','mTracer'].forEach(i=>$(i).textContent='--'); $('mTracerS').textContent=''; $('mCarryS').textContent=''; $('phases').innerHTML=''; $('items').innerHTML=''; $('notes').textContent=''; return; }
+  if(!rec){ $('total').textContent='--'; $('grade').textContent='まだ解析していません'; $('advice').textContent='動画を読み込んで「解析する」を押すと結果が表示されます。'; ['mCarry','mHead','mHand','mTempo','mTracer'].forEach(i=>$(i).textContent='--'); $('mTracerS').textContent=''; $('mCarryS').textContent=''; $('phases').innerHTML=''; $('items').innerHTML=''; $('notes').textContent=''; renderFlight(null); return; }
   const r=rec.res;
   $('total').textContent=r.total;
   $('grade').textContent=r.total>=85?'とても良いスイングです':r.total>=70?'良いスイングです':r.total>=55?'あと一歩です':'改善の余地があります';
@@ -641,8 +720,9 @@ function renderResult(){
   $('mHead').innerHTML=`${fmt(headOf(r,rec.meta.club||'D'),1)}<small>m/s</small>`;
   $('mHand').innerHTML=`${fmt(r.speed.hand,1)}<small>m/s</small>`;
   $('mTempo').innerHTML=`${fmt(r.tempo,1)}<small>：1</small>`;
-  $('mTracer').textContent=rec.tracer.kind==='detected'?'映像から検出':'推定ライン';
-  $('mTracerS').textContent=rec.tracer.kind==='detected'?'打ち出し直後のボールを追跡':'ボールを追えなかったため推定で表示';
+  $('mTracer').textContent=rec.tracer.kind==='detected'?'検出＋予測':'予測ライン';
+  $('mTracerS').textContent=(rec.tracer.kind==='detected'?'打ち出し直後を追跡し、その先を予測':'ボールを追えなかったため予測で表示')+(rec.meta.view==='dtl'?'・落下地点まで表示':'・落下地点は下の弾道図で表示');
+  renderFlight(rec);
   const ph=$('phases'); ph.innerHTML='';
   for(const [k,l] of Object.entries(PHASE_LABEL)){ const b=document.createElement('button'); b.type='button'; b.innerHTML=`${l}<b>${fmt(rec.frames[r.phases[k]].tr,2)}秒</b>`; b.addEventListener('click',()=>{stopPlay();gotoIdx(r.phases[k]);}); ph.appendChild(b); }
   const ul=$('items'); ul.innerHTML='';
@@ -680,7 +760,7 @@ async function openRecord(rec){
     await waitMeta(); if(S.rec!==rec) return;
     try{ await vid.play(); vid.pause(); }catch(e){}
     await seek(vid,rec.frames[S.cur].tm);
-    $('hint').textContent='保存した動画の解析範囲に、骨格と弾道ラインを重ねて表示しています。「再生」で0.5倍速になります。ボールの位置がずれているときは、インパクト前の画面でボールをタップすると直せます。';
+    $('hint').textContent='保存した動画の解析範囲に、骨格と弾道ラインを重ねて表示しています。「再生」で0.3倍速になります。ボールの位置がずれているときは、インパクト前の画面でボールをタップすると直せます。';
   } else {
     S.mode='record'; vid.hidden=true; vid.pause(); thumb.hidden=false; thumb.src=rec.thumb;
     $('hint').textContent=rec.sample?'いまは練習用のサンプルを表示しています（サンプルには映像がないため骨格だけが動きます）。「動画を選ぶ」から自分のスイング動画を読み込んでください。':'この記録は動画が保存されていないため、アドレス時の静止画の上に骨格の動きだけを再生します。';
@@ -694,7 +774,7 @@ function stopPlay(){ S.playing=false; cancelAnimationFrame(raf); if(S.mode==='vi
 function loop(){
   if(!S.playing) return;
   if(S.mode==='video'){ seekEl.value=vid.currentTime; if(S.rec) S.cur=nearestIdx(vid.currentTime); updateTime(); draw(); const fr=framesNow(); if(vid.ended||vid.paused||(S.rec&&fr.length&&vid.currentTime>=fr[fr.length-1].tm)){stopPlay();return;} }
-  else { const fr=framesNow(); const tm=playTm0+(performance.now()-playT0)/1000*(fr[fr.length-1].tm-fr[0].tm>4?1:0.5); S.cur=nearestIdx(tm); seekEl.value=S.cur; updateTime(); draw(); if(S.cur>=fr.length-1){stopPlay();return;} }
+  else { const fr=framesNow(); const tm=playTm0+(performance.now()-playT0)/1000*PLAY_RATE; S.cur=nearestIdx(tm); seekEl.value=S.cur; updateTime(); draw(); if(S.cur>=fr.length-1){stopPlay();return;} }
   raf=requestAnimationFrame(loop);
 }
 $('play').addEventListener('click',()=>{
@@ -702,7 +782,7 @@ $('play').addEventListener('click',()=>{
   if(S.mode==='video'){ if(!vid.src) return;
     const fr=framesNow();
     if(S.rec&&fr.length&&(vid.currentTime>=fr[fr.length-1].tm-0.01||vid.currentTime<fr[0].tm)) vid.currentTime=fr[0].tm;
-    vid.playbackRate=S.rec?0.5:1; S.playing=true; $('play').textContent='一時停止';
+    vid.playbackRate=S.rec?PLAY_RATE:1; S.playing=true; $('play').textContent='一時停止';
     vid.play().then(()=>{ if(S.playing) raf=requestAnimationFrame(loop); }).catch(()=>{ stopPlay(); $('status').textContent='動画を再生できませんでした。もう一度「再生」を押してください。'; });
     return; }
   else { const fr=framesNow(); if(!fr.length) return; if(S.cur>=fr.length-1) S.cur=0; playT0=performance.now(); playTm0=fr[S.cur].tm; }
@@ -801,7 +881,7 @@ $('run').addEventListener('click',async()=>{
     S.rec=rec; S.cur=res.phases.address; $('progBar').style.width='100%';
     $('status').textContent=rec.noVideo?'解析が終わり、履歴に保存しました（空き容量が足りないため動画は保存していません）':'解析が終わり、動画と一緒に履歴に保存しました';
     setSlider(); seekEl.value=vid.currentTime; renderResult(); renderHistory(); updateTime(); draw();
-    $('hint').textContent='解析した範囲だけを再生します。「再生」で0.5倍速になります。ボールの位置がずれているときは、インパクト前の画面でボールをタップすると直せます。';
+    $('hint').textContent='解析した範囲だけを再生します。「再生」で0.3倍速になります。ボールの位置がずれているときは、インパクト前の画面でボールをタップすると直せます。';
   }catch(err){
     $('status').textContent=err&&err.message?err.message:'解析に失敗しました。別の動画で試してください。';
     log('停止: '+(err&&err.message||err)); if(!S.cancel) $('logBox').open=true;
@@ -859,7 +939,7 @@ dbOpen().then(()=>{ openRecord(SAMPLE); });
 setTimeout(()=>{ getLandmarker(settings().cx).catch(()=>{}); },600);
 $('cx').addEventListener('change',()=>{ getLandmarker(settings().cx).catch(()=>{}); });
 // 解析後にクラブを選び直したら、表示中の記録のクラブも直して再計算する
-$('club').addEventListener('change',()=>{ const r=S.rec; if(!r||r.sample||S.busy) return; r.meta.club=$('club').value; dbPut(r); renderResult(); renderHistory(); $('status').textContent=`クラブを「${(CLUBS[r.meta.club]||CLUBS.D).name}」に変えて計算し直しました`; });
+$('club').addEventListener('change',()=>{ const r=S.rec; if(!r||r.sample||S.busy) return; r.meta.club=$('club').value; dbPut(r); renderResult(); renderHistory(); $('status').textContent=`クラブを「${(CLUBS[r.meta.club]||CLUBS.D).name}」に変えて計算し直しました`; draw(); });
 })();
 </script>
 
