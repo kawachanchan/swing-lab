@@ -76,6 +76,7 @@ details.tips ul{margin:8px 0 0;padding-left:1.2em}
 .progress{flex:1;min-width:120px;height:8px;background:var(--surface-2);border-radius:99px;overflow:hidden}
 .progress div{height:100%;width:0;background:var(--accent);transition:width .15s}
 .badge{font-size:12px;padding:2px 8px;border-radius:99px;background:var(--surface-2);color:var(--muted);white-space:nowrap}
+.badge.ok{background:var(--accent);color:var(--accent-ink)}
 .badge.sample{background:var(--warn);color:var(--surface)}
 .score-head{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
 .total{display:flex;align-items:baseline;gap:4px}
@@ -161,7 +162,7 @@ footer{font-size:12px;color:var(--muted);text-align:center}
   </section>
 
   <section class="card" aria-labelledby="h-view">
-    <div class="row"><h2 id="h-view">2. 確認と解析</h2><span class="spacer"></span><span class="badge" id="modeBadge">サンプル表示中</span></div>
+    <div class="row"><h2 id="h-view">2. 確認と解析</h2><span class="spacer"></span><span class="badge" id="engine">解析エンジン 準備中…</span><span class="badge" id="modeBadge">サンプル表示中</span></div>
     <div class="stage-wrap"><div class="stage" id="stage">
       <video id="vid" playsinline muted preload="auto" hidden></video>
       <img id="thumb" alt="" hidden>
@@ -220,7 +221,7 @@ footer{font-size:12px;color:var(--muted);text-align:center}
   <footer>スイングスピードと弾道ラインは映像から計算した推定値です。弾道計測器の数値とは一致しません。</footer>
 </div>
 
-<script src="mp/pose.js"></script>
+<script src="mp2/vision_bundle.js"></script>
 <script>
 (() => {
 "use strict";
@@ -433,34 +434,42 @@ const nextFrame=()=>new Promise(r=>requestAnimationFrame(()=>r()));
 window.addEventListener('error',e=>log('エラー: '+e.message));
 window.addEventListener('unhandledrejection',e=>log('エラー: '+(e.reason&&e.reason.message||e.reason)));
 
-// ---------- 骨格検出（MediaPipe Pose） ----------
-let pose=null, poseCx=null, lastRes=null;
+// ---------- 骨格検出（MediaPipe Tasks：PoseLandmarker） ----------
+let landmarker=null, lmCx=null, lmLoading=null, tsCounter=0;
 function loadScript(src){ return new Promise((res,rej)=>{ const sc=document.createElement('script'); sc.src=src; sc.onload=res; sc.onerror=()=>rej(new Error('解析エンジンのファイルを読み込めませんでした。通信環境を確認してください。')); document.head.appendChild(sc); }); }
 async function checkFiles(list){
   const miss=[];
-  for(const f of list){ try{ const r=await fetch('mp/'+f,{method:'HEAD',cache:'no-store'}); if(r.status===404) miss.push(f); }catch(e){} }
-  if(miss.length){ log('見つからないファイル: '+miss.join(', ')); const er=new Error(`mpフォルダに必要なファイルがありません（${miss.join('、')}）。GitHubに mp フォルダの中身がすべてアップロードされているか確認してください。`); er.missing=true; throw er; }
+  for(const f of list){ try{ const r=await fetch('mp2/'+f,{method:'HEAD',cache:'no-store'}); if(r.status===404) miss.push(f); }catch(e){} }
+  if(miss.length){ log('見つからないファイル: '+miss.join(', ')); const er=new Error(`mp2フォルダに必要なファイルがありません（${miss.join('、')}）。GitHubに mp2 フォルダの中身がすべてアップロードされているか確認してください。`); er.missing=true; throw er; }
 }
-async function resolveAssets(cx){
-  // mp/ に元のファイルがあればそのまま使う。無い環境では埋め込み版（Base64）から読み込む
-  try{ const r=await fetch('mp/pose_web.binarypb',{cache:'no-store'}); const ct=r.headers.get('content-type')||''; if(r.ok&&!/html/.test(ct)){ await checkFiles(['pose_solution_packed_assets_loader.js','pose_solution_simd_wasm_bin.js','pose_solution_simd_wasm_bin.wasm','pose_solution_wasm_bin.js','pose_solution_wasm_bin.wasm','pose_solution_packed_assets.data',cx?'pose_landmark_full.tflite':'pose_landmark_lite.tflite']); log('モデル: mpフォルダのファイルを使用'); return {}; } }catch(e){ if(e&&e.missing) throw e; }
+async function modelSource(cx){
+  // mp2/ にモデルファイルがあればそのまま使う。無い環境では埋め込み版（Base64）から読み込む
+  const name=cx?'pose_landmarker_full.task':'pose_landmarker_lite.task';
+  try{ const r=await fetch('mp2/'+name,{method:'HEAD',cache:'no-store'}); const ct=r.headers.get('content-type')||''; if(r.ok&&!/html/.test(ct)){ log('モデル: mp2フォルダのファイルを使用'); return {modelAssetPath:'mp2/'+name}; } }catch(e){}
   log('モデル: 埋め込み版を使用');
-  const need=['pose_solution_packed_assets.data','pose_web.binarypb',cx?'pose_landmark_full.tflite':'pose_landmark_lite.tflite'], map={};
-  for(const f of need){ await loadScript('mp/b64/'+f.replace(/\./g,'_')+'.js'); const b=atob(window.__MPB[f]); const u=new Uint8Array(b.length); for(let i=0;i<b.length;i++) u[i]=b.charCodeAt(i); map[f]=URL.createObjectURL(new Blob([u])); delete window.__MPB[f]; }
-  return map;
+  await loadScript('mp2/b64/'+name.replace(/\./g,'_')+'.js');
+  const b=atob(window.__MPB[name]); const u=new Uint8Array(b.length); for(let i=0;i<b.length;i++) u[i]=b.charCodeAt(i); delete window.__MPB[name];
+  return {modelAssetBuffer:u};
 }
-async function getPose(cx){
-  if(typeof Pose==='undefined') throw new Error('解析エンジン（MediaPipe）を読み込めませんでした。ページを再読み込みしてください。');
-  if(pose&&poseCx===cx){ pose.reset(); return pose; }
-  if(pose){ try{await pose.close();}catch(e){} }
-  const assets=await resolveAssets(cx);
-  pose=new Pose({locateFile:f=>assets[f]||('mp/'+f)});
-  pose.setOptions({modelComplexity:cx,smoothLandmarks:true,enableSegmentation:false,minDetectionConfidence:0.5,minTrackingConfidence:0.5});
-  pose.onResults(r=>{lastRes=r;});
-  log('解析エンジンを初期化中');
-  try{ await withTimeout(pose.initialize(),90000,'解析エンジンの準備が90秒たっても終わりませんでした。通信環境のよい場所でページを再読み込みしてください。'); }
-  catch(e){ try{pose.close();}catch(_){} pose=null; poseCx=null; throw e; }
-  log('解析エンジンの準備完了'); poseCx=cx; return pose;
+function setEngine(state){ const e=document.getElementById('engine'); if(!e) return; e.textContent=state==='ready'?'解析エンジン 準備OK':state==='error'?'解析エンジン エラー':'解析エンジン 準備中…'; e.className='badge'+(state==='ready'?' ok':''); }
+async function getLandmarker(cx){
+  if(typeof Vision==='undefined') throw new Error('解析エンジン（MediaPipe）を読み込めませんでした。ページを再読み込みしてください。');
+  if(landmarker&&lmCx===cx) return landmarker;
+  if(!lmLoading||lmLoading.cx!==cx){
+    setEngine('loading');
+    const job=(async()=>{
+      const t0=performance.now(); log('解析エンジンを準備中');
+      await checkFiles(['wasm/vision_wasm_internal.js','wasm/vision_wasm_internal.wasm']);
+      const fs=await Vision.FilesetResolver.forVisionTasks('mp2/wasm');
+      const src=await modelSource(cx);
+      const lm=await Vision.PoseLandmarker.createFromOptions(fs,{baseOptions:{...src,delegate:'CPU'},runningMode:'VIDEO',numPoses:1,minPoseDetectionConfidence:0.5,minPosePresenceConfidence:0.5,minTrackingConfidence:0.5});
+      if(landmarker){ try{landmarker.close();}catch(e){} }
+      landmarker=lm; lmCx=cx; log(`解析エンジンの準備完了（${((performance.now()-t0)/1000).toFixed(1)}秒）`); setEngine('ready'); return lm;
+    })();
+    lmLoading={cx,job};
+    job.catch(e=>{ log('エンジン準備エラー: '+(e&&e.message||e)); setEngine('error'); if(lmLoading&&lmLoading.job===job) lmLoading=null; });
+  }
+  return withTimeout(lmLoading.job,90000,'解析エンジンの準備が90秒たっても終わりませんでした。通信環境のよい場所でページを再読み込みしてください。');
 }
 function seek(v,t){
   return new Promise(res=>{
@@ -695,7 +704,7 @@ $('run').addEventListener('click',async()=>{
   $('prog').hidden=false; $('progBar').style.width='0%';
   try{
     $('status').textContent='解析エンジンを準備しています（初回は数十秒かかることがあります）…';
-    const p=await getPose(s.cx);
+    const lmk=await getLandmarker(s.cx);
     if(vid.readyState<2){ log('動画のデータを読み込み待ち'); await withTimeout(new Promise(r=>{ if(vid.readyState>=2) return r(); vid.addEventListener('loadeddata',()=>r(),{once:true}); try{vid.load();}catch(e){} }),15000,'動画を読み込めませんでした。別の動画で試すか、ページを再読み込みしてください。'); }
     // 大きい動画（4Kなど）はそのまま渡すと重いので、縮小したキャンバスに描いてから解析する
     const sc=Math.min(1,640/Math.max(meta.vw,meta.vh)), fc=document.createElement('canvas'); fc.width=Math.round(meta.vw*sc); fc.height=Math.round(meta.vh*sc); const fctx=fc.getContext('2d');
@@ -706,10 +715,9 @@ $('run').addEventListener('click',async()=>{
     for(let i=0;i<count;i++){
       if(S.cancel) throw new Error('解析を中止しました。');
       const tm=t0+i*st, ta=performance.now(); await seek(vid,tm); const tb=performance.now();
-      fctx.drawImage(vid,0,0,fc.width,fc.height); lastRes=null;
-      await withTimeout(p.send({image:fc}),20000,'骨格の検出が止まってしまいました。「骨格検出の精度」を「標準」にするか、ページを再読み込みしてもう一度試してください。');
-      if(i<3||i%30===0) log(`コマ${i+1}: 移動${Math.round(tb-ta)}ms 検出${Math.round(performance.now()-tb)}ms 人物${lastRes&&lastRes.poseLandmarks?'あり':'なし'}`);
-      const lm=lastRes&&lastRes.poseLandmarks;
+      fctx.drawImage(vid,0,0,fc.width,fc.height);
+      tsCounter+=33; const out=lmk.detectForVideo(fc,tsCounter); const lm=out&&out.landmarks&&out.landmarks[0];
+      if(i<3||i%30===0) log(`コマ${i+1}: 移動${Math.round(tb-ta)}ms 検出${Math.round(performance.now()-tb)}ms 人物${lm?'あり':'なし'}`);
       frames.push({tm:r4(tm),tr:r4((tm-t0)/s.slow),p:lm?MP_IDX.map(j=>[r4(lm[j].x),r4(lm[j].y),Math.round((lm[j].visibility??1)*100)/100]):null});
       if(lm) ok++;
       $('progBar').style.width=`${Math.round((i+1)/count*90)}%`; $('status').textContent=`骨格を検出中 ${i+1} / ${count} コマ`;
@@ -789,6 +797,9 @@ const SAMPLE=makeSample();
 // ---------- 起動 ----------
 loadSettings();
 dbOpen().then(()=>{ openRecord(SAMPLE); });
+// ページを開いたら裏で解析エンジンを準備しておく（「解析する」を押したときの待ち時間をなくす）
+setTimeout(()=>{ getLandmarker(settings().cx).catch(()=>{}); },600);
+$('cx').addEventListener('change',()=>{ getLandmarker(settings().cx).catch(()=>{}); });
 })();
 </script>
 
