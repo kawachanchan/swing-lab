@@ -420,21 +420,29 @@ function flightOf(rec){ const club=rec.meta.club||'D', fl=CLUB_FLIGHT[club]||CLU
 // 映像に重ねる弾道ライン。後方撮影は遠近法で落下地点まで描く。正面撮影は画面の外へ飛んでいく
 function buildTracer(rec){
   const meta=rec.meta, b=rec.ball, W=meta.vw, H=meta.vh, dir=meta.hand==='R'?1:-1, det=rec.tracer&&rec.tracer.kind==='detected'?rec.tracer.pts:null;
-  if(meta.view!=='dtl'){ return {pts:det&&det.length>=3?extendFace(det,b,meta):estTracer(b,meta),landing:null}; }
+  if(meta.view!=='dtl'){ if(det&&det.length>=3){ const sp=extendFace(det,b,meta); return {pts:sp.pts,nDet:sp.nDet,det,landing:null}; } return {pts:estTracer(b,meta),nDet:0,landing:null}; }
   const fl=flightOf(rec), B={x:b.x*W,y:b.y*H};
   // カメラは手元の高さにあるとみなし、アドレス時の手元の高さを地平線とする
   const f0=rec.frames[rec.res.phases.address].p; let horizon=(f0[KI.lw][1]+f0[KI.rw][1])/2*H;
   if(B.y-horizon<0.12*H) horizon=B.y-0.3*H;
   const camH=1.0, camBack=3.0, fpx=(B.y-horizon)*camBack/camH;
-  // 打ち出し直後のボールを追えていれば、その左右の向きを使う
-  let side=0; if(det&&det.length>=2){ const l=det[det.length-1]; const dy=(b.y-l.y)*H; if(dy>2) side=clamp((l.x-b.x)*W/dy,-1.5,1.5); }
   // カメラは飛球線と平行に向いているとみなし、飛球線は画面中央の消失点に向かって細くなる
-  const cx=W/2, Xb=(B.x-cx)*camBack/fpx, lateral=fl.D*0.08*side, pts=[];
-  for(let k=0;k<=60;k++){ const s=k/60, Z=fl.D*s, Y=fl.apex*flightShape(s)/FLIGHT_MAX, X=Xb+lateral*s*s, depth=Z+camBack;
-    pts.push({x:(cx+fpx*X/depth)/W,y:(horizon-fpx*(Y-camH)/depth)/H}); }
-  return {pts,landing:pts[pts.length-1],carryYd:fl.carryYd};
+  const cx=W/2, Xb=(B.x-cx)*camBack/fpx;
+  const make=side=>{ const lateral=fl.D*0.08*side, arr=[]; for(let k=0;k<=60;k++){ const s=k/60, Z=fl.D*s, Y=fl.apex*flightShape(s)/FLIGHT_MAX, X=Xb+lateral*s*s, depth=Z+camBack; arr.push({x:(cx+fpx*X/depth)/W,y:(horizon-fpx*(Y-camH)/depth)/H}); } return arr; };
+  // 追跡できた点があれば、それに一番合う左右の曲がり具合を選ぶ
+  let side=0; if(det&&det.length>=3){ let best=1e18; for(let sd=-1.5; sd<=1.5001; sd+=0.1){ const m=make(sd); let e=0; for(const q of det){ let md=1e18; for(const p2 of m){ const d=((p2.x-q.x)*W)**2+((p2.y-q.y)*H)**2; if(d<md) md=d; } e+=md; } if(e<best){best=e; side=sd;} } }
+  const pts=make(side);
+  if(det&&det.length>=3){ const sp=splice(det,pts); return {pts:sp.pts,nDet:sp.nDet,det,landing:sp.pts[sp.pts.length-1],carryYd:fl.carryYd}; }
+  return {pts,nDet:0,landing:pts[pts.length-1],carryYd:fl.carryYd};
 }
-function extendFace(det,b,meta){ const est=estTracer(b,meta); const last=det[det.length-1]; let j=0,bd=1e9; est.forEach((p,k)=>{ const d=Math.hypot(p.x-last.x,p.y-last.y); if(d<bd){bd=d;j=k;} }); return det.concat(est.slice(j+1)); }
+// 追跡できた点の先に予測ラインをつなぐ。つなぎ目のずれは、落下地点に向かって少しずつ0に戻す
+function splice(det,model){
+  // つなぐ位置は上昇中の部分（最高点より手前）から選ぶ。後方撮影では上りと下りの線が近いため
+  const last=det[det.length-1], lim=Math.max(1,Math.floor(model.length*0.6)); let j=0,bd=1e9; model.forEach((p,k)=>{ if(k>lim) return; const d=Math.hypot(p.x-last.x,p.y-last.y); if(d<bd){bd=d;j=k;} });
+  const ox=last.x-model[j].x, oy=last.y-model[j].y, rest=model.slice(j+1), n=rest.length;
+  return {pts:det.map(p=>({x:p.x,y:p.y})).concat(rest.map((p,k)=>{ const w=1-(k+1)/(n+1); return {x:p.x+ox*w,y:p.y+oy*w}; })),nDet:det.length};
+}
+function extendFace(det,b,meta){ return splice(det,estTracer(b,meta)); }
 function estTracer(ball, meta){
   const W=meta.vw,H=meta.vh,dir=meta.hand==='R'?1:-1,B={x:ball.x*W,y:ball.y*H},pts=[];
   if(meta.view==='face'){
@@ -446,41 +454,74 @@ function estTracer(ball, meta){
   }
   return pts;
 }
+// 打ち出し後のボールを追跡する。
+// 高い解像度・細かい時間刻みで、前のコマから「新しく現れた白く明るい小さな点」を探し、動きの予測位置の周りで追い続ける
 async function trackBall(video, frames, res, meta, ball){
-  const sw=200, sh=Math.round(200*meta.vh/meta.vw);
-  const cv=document.createElement('canvas'); cv.width=sw; cv.height=sh; const cx=cv.getContext('2d',{willReadFrequently:true});
-  const i0=Math.max(0,res.phases.impact-1), i1=Math.min(frames.length-1,res.phases.impact+10);
-  const grays=[];
-  for(let i=i0;i<=i1;i++){
-    await seek(video,frames[i].tm); cx.drawImage(video,0,0,sw,sh);
-    const d=cx.getImageData(0,0,sw,sh).data, g=new Uint8Array(sw*sh);
-    for(let k=0;k<g.length;k++) g[k]=(d[k*4]*77+d[k*4+1]*150+d[k*4+2]*29)>>8;
-    grays.push({g,f:frames[i]});
+  const sc=Math.min(1,2000/Math.max(meta.vw,meta.vh)), W=Math.round(meta.vw*sc), H=Math.round(meta.vh*sc);
+  const mk=()=>{ const c=document.createElement('canvas'); c.width=W; c.height=H; return c.getContext('2d',{willReadFrequently:true}); };
+  let cur=mk(), prev=mk();
+  const slow=meta.slow||1, dir=meta.hand==='R'?1:-1;
+  const f0=frames[res.phases.address].p, P=k=>({x:f0[KI[k]][0]*W,y:f0[KI[k]][1]*H});
+  const torso=dist(mid(P('ls'),P('rs')),mid(P('lh'),P('rh')))||H*0.2;
+  const bodyPx=dist(P('nose'),mid(P('la'),P('ra')))||H*0.6, mpp=(meta.heightCm/100*0.88)/bodyPx;
+  const dBall=Math.max(2,0.0427/mpp), A=Math.PI*dBall*dBall/4, O={x:ball.x*W,y:ball.y*H};
+  const step=slow>1?1/60:1/120;           // 動画上の時間刻み（秒）。同じコマが続くときは自動で飛ばす
+  const lum=(d,i)=>(d[i]*77+d[i+1]*150+d[i+2]*29)>>8;
+  // 1) 打ち出しの瞬間：アドレス時と比べてボールの場所の見た目が変わった最初のコマ
+  const r=Math.max(3,Math.round(dBall*0.9)), px0=clamp(Math.round(O.x-r),0,W-1), py0=clamp(Math.round(O.y-r),0,H-1), pw=Math.min(2*r+1,W-px0), ph=Math.min(2*r+1,H-py0);
+  const patch=ctx=>{ const d=ctx.getImageData(px0,py0,pw,ph).data, a=new Float32Array(pw*ph); for(let i=0;i<a.length;i++) a[i]=lum(d,i*4); return a; };
+  await seek(video,frames[res.phases.address].tm); cur.drawImage(video,0,0,W,H); const ref=patch(cur);
+  const tImp=frames[res.phases.impact].tm, tTop=frames[res.phases.top].tm;
+  let tLaunch=null;
+  for(let t=Math.max(tTop,tImp-0.12*slow); t<=tImp+0.15*slow; t+=step){
+    await seek(video,t); cur.drawImage(video,0,0,W,H); const q=patch(cur); let sd=0; for(let i=0;i<q.length;i++) sd+=Math.abs(q[i]-ref[i]);
+    if(sd/q.length>28){ tLaunch=t; break; }
   }
-  const dir=meta.hand==='R'?1:-1, maxArea=sw*sh*0.004;
-  const origin={x:ball.x*sw,y:ball.y*sh}; const pts=[origin]; let miss=0;
-  for(let k=1;k<grays.length;k++){
-    const a=grays[k-1].g,b=grays[k].g,bin=new Uint8Array(sw*sh);
-    for(let p=0;p<bin.length;p++) bin[p]=Math.abs(a[p]-b[p])>28?1:0;
-    // 体の範囲（足首は除く）を除外
-    const P=grays[k].f.p; let bx0=1,by0=1,bx1=0,by1=0;
-    ['nose','ls','rs','le','re','lw','rw','lh','rh','lk','rk'].forEach(key=>{const q=P[KI[key]];bx0=Math.min(bx0,q[0]);by0=Math.min(by0,q[1]);bx1=Math.max(bx1,q[0]);by1=Math.max(by1,q[1]);});
-    bx0=(bx0-0.03)*sw;bx1=(bx1+0.03)*sw;by0=(by0-0.03)*sh;by1=(by1+0.01)*sh;
-    const comps=[], seen=new Uint8Array(sw*sh), st=[];
-    for(let p=0;p<bin.length;p++){ if(!bin[p]||seen[p]) continue; let area=0,sx=0,sy=0,x0=sw,x1=0,y0=sh,y1=0; st.length=0; st.push(p); seen[p]=1;
-      while(st.length){const q=st.pop(),x=q%sw,y=(q/sw)|0; area++;sx+=x;sy+=y;if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y;
-        const nb=[q-1,q+1,q-sw,q+sw]; for(const r of nb){ if(r<0||r>=bin.length) continue; if((r%sw===0&&x===sw-1)||(x===0&&r%sw===sw-1)) continue; if(bin[r]&&!seen[r]){seen[r]=1;st.push(r);} } if(area>maxArea*3) break; }
-      if(area<1||area>maxArea||(x1-x0)>sw*0.12||(y1-y0)>sh*0.12) continue;
-      const c={x:sx/area,y:sy/area}; if(c.x>bx0&&c.x<bx1&&c.y>by0&&c.y<by1) continue; comps.push(c); }
+  if(tLaunch==null) tLaunch=tImp;
+  log(`ボール追跡: 打ち出し ${fmt(tLaunch,3)}秒（骨格から見たインパクト ${fmt(tImp,3)}秒）、ボール直径 約${dBall.toFixed(1)}px`);
+  // 2) 追跡
+  await seek(video,Math.max(0,tLaunch-step)); prev.drawImage(video,0,0,W,H);
+  const pts=[{x:O.x,y:O.y,tm:Math.max(0,tLaunch-step)}]; let miss=0, iter=0, dup=0;
+  const tEnd=Math.min((video.duration||1e9)-0.005, tLaunch+0.8*slow), vmax=80/mpp; // 最大 秒速80m
+  const fwd=meta.view==='dtl'?{x:0,y:-1}:(()=>{ const v={x:dir,y:-0.8}, n=Math.hypot(v.x,v.y); return {x:v.x/n,y:v.y/n}; })();
+  for(let t=tLaunch; t<=tEnd&&iter<200; t+=step, iter++){
+    await seek(video,t); cur.drawImage(video,0,0,W,H);
+    const last=pts[pts.length-1], dtR=Math.max(1e-3,(t-last.tm)/slow);
+    // 探す範囲：直前の位置から「そのままの速さで進んだ位置（の1.3倍先）」までの帯。遠ざかって減速しても見失わないようにする
+    let pred, R, segA, segB;
+    if(pts.length===1){ pred=last; R=Math.max(8*dBall,vmax*dtR*1.2); segA=segB=last; }
+    else { const a=pts[pts.length-2], dtp=Math.max(1e-3,(last.tm-a.tm)/slow), vx=(last.x-a.x)/dtp, vy=(last.y-a.y)/dtp;
+      pred={x:last.x+vx*dtR,y:last.y+vy*dtR}; segA=last; segB={x:last.x+vx*dtR*1.3,y:last.y+vy*dtR*1.3};
+      R=Math.max(3*dBall,Math.hypot(vx,vy)*dtR*0.25+4+dBall*Math.min(miss,6)*0.5); }
+    if(Math.min(segA.x,segB.x)>W+R||Math.max(segA.x,segB.x)<-R||Math.min(segA.y,segB.y)>H+R||Math.max(segA.y,segB.y)<-R) break; // 画面の外へ出た
+    const x0=clamp(Math.floor(Math.min(segA.x,segB.x)-R),0,W-1), y0=clamp(Math.floor(Math.min(segA.y,segB.y)-R),0,H-1), x1=clamp(Math.ceil(Math.max(segA.x,segB.x)+R),0,W-1), y1=clamp(Math.ceil(Math.max(segA.y,segB.y)+R),0,H-1);
+    const w=x1-x0+1, h=y1-y0+1; if(w<3||h<3) break;
+    const dc=cur.getImageData(x0,y0,w,h).data, dp=prev.getImageData(x0,y0,w,h).data, m=new Uint8Array(w*h), L=new Uint8Array(w*h);
+    let tot=0;
+    for(let i=0;i<w*h;i++){ const j=i*4, l=lum(dc,j), df=l-lum(dp,j); tot+=Math.abs(df); L[i]=l; const sat=Math.max(dc[j],dc[j+1],dc[j+2])-Math.min(dc[j],dc[j+1],dc[j+2]); m[i]=(df>16&&l>105&&sat<85)?1:0; }
+    if(tot/(w*h)<0.05) dup++;
+    // 候補（つながった明るい点のかたまり）
+    const cands=[], st=[];
+    for(let i=0;i<w*h;i++){ if(!m[i]) continue; let area=0,sx=0,sy=0,sl=0; st.length=0; st.push(i); m[i]=0;
+      while(st.length){ const k=st.pop(), x=k%w, y=(k/w)|0; area++; sx+=x; sy+=y; sl+=L[k];
+        if(x>0&&m[k-1]){m[k-1]=0;st.push(k-1);} if(x<w-1&&m[k+1]){m[k+1]=0;st.push(k+1);} if(y>0&&m[k-w]){m[k-w]=0;st.push(k-w);} if(y<h-1&&m[k+w]){m[k+w]=0;st.push(k+w);} }
+      if(area<1||area>Math.max(16,A*10)) continue;
+      cands.push({x:x0+sx/area,y:y0+sy/area,area,l:sl/area}); }
     let pick=null;
-    const last=pts[pts.length-1];
-    if(pts.length===1){ let best=-1e9; for(const c of comps){ const dd=dist(c,origin); if(dd<2||dd>sw*0.35) continue; const fw=meta.view==='face'?dir*(c.x-origin.x)-(c.y-origin.y)*0.6:-(c.y-origin.y); if(fw>0&&fw>best){best=fw;pick=c;} } }
-    else { const prev=pts[pts.length-2], pred={x:2*last.x-prev.x,y:2*last.y-prev.y}, rad=Math.max(8,0.8*dist(last,prev)+6); let bd=1e9;
-      for(const c of comps){ const dd=dist(c,pred); if(dd<rad&&dist(c,origin)>dist(last,origin)&&dd<bd){bd=dd;pick=c;} } }
-    if(pick){pts.push(pick);miss=0;} else if(++miss>=2&&pts.length>1) break;
+    if(pts.length===1){ let best=-1e9;
+      for(const c of cands){ const vx=c.x-O.x, vy=c.y-O.y, d=Math.hypot(vx,vy); if(d<dBall*0.8) continue; const al=(vx*fwd.x+vy*fwd.y)/d; if(al<0.2) continue;
+        const sc2=al+c.l/255-Math.abs(Math.log(Math.max(1,c.area)/Math.max(1,A)))*0.15; if(sc2>best){best=sc2;pick=c;} } }
+    else { let bd=1e9; const dl=dist(last,O);
+      const segD=c=>{ const ux=segB.x-segA.x, uy=segB.y-segA.y, L2=ux*ux+uy*uy||1, t2=clamp(((c.x-segA.x)*ux+(c.y-segA.y)*uy)/L2,0,1); return {d:Math.hypot(c.x-segA.x-ux*t2,c.y-segA.y-uy*t2),t:t2}; };
+      for(const c of cands){ const q=segD(c); if(q.d<R&&q.t>0.05&&dist(c,O)>dl+dBall*0.2){ const score=q.d+Math.abs(q.t-0.77)*R*0.3; if(score<bd){bd=score;pick=c;} } } }
+    if(pick){ pts.push({x:pick.x,y:pick.y,tm:t}); miss=0; }
+    else { miss++; // 見失っても、実際の時間で0.12秒（打ち出し直後は0.08秒）までは探し続ける
+      if((t-last.tm)/slow>(pts.length>2?0.12:0.08)) break; }
+    const tmp=prev; prev=cur; cur=tmp;
   }
+  log(`ボール追跡: ${pts.length-1}点を追跡（読んだコマ ${iter}、同じコマ ${dup}）`);
   if(pts.length<3) return null;
-  return pts.map(p=>({x:p.x/sw,y:p.y/sh}));
+  return pts.map(q=>({x:r4(q.x/W),y:r4(q.y/H),tm:r4(q.tm)}));
 }
 
 // ---------- ログ・タイムアウト ----------
@@ -636,23 +677,36 @@ function drawInner(W,H){
   octx.strokeStyle='rgba(255,255,255,.9)'; octx.lineWidth=lw*0.6; octx.beginPath(); octx.arc(nz.x,nz.y,W*0.035,0,Math.PI*2); octx.stroke();
   // 弾道ライン
   if(i<ph.impact){ drawBall(rec.ball,W,H,lw); }
-  else { const T=tracerCached(rec), end=Math.max(ph.impact+4,fr.length-1), frac=clamp((i-ph.impact+1)/Math.max(4,end-ph.impact),0.06,1);
-    drawTracer(T.pts,frac,W,H,lw);
-    if(T.landing&&frac>=1){ const L={x:T.landing.x*W,y:T.landing.y*H}; octx.save(); octx.strokeStyle=getCss('--tracer'); octx.fillStyle='#fff'; octx.lineWidth=lw*0.8; octx.beginPath(); octx.arc(L.x,L.y,lw*2.2,0,Math.PI*2); octx.fill(); octx.stroke();
+  else { const T=tracerCached(rec), end=Math.max(ph.impact+4,fr.length-1); let frac;
+    if(T.nDet>=3){ const tNow=S.mode==='video'?vid.currentTime:f.tm, det=T.det, lastTm=det[det.length-1].tm, tEnd=Math.min(fr[fr.length-1].tm-0.02,lastTm+0.5*(rec.meta.slow||1));
+      let k=0; while(k<det.length&&det[k].tm<=tNow+1e-4) k++;
+      const L=cumLen(T.pts,W,H), total=L[L.length-1]||1;
+      if(k<det.length){ frac=L[Math.max(0,k-1)]/total; }
+      else { const f2=tEnd>lastTm?clamp((tNow-lastTm)/(tEnd-lastTm),0,1):1; frac=(L[T.nDet-1]+(total-L[T.nDet-1])*f2)/total; }
+      frac=Math.max(frac,0.02); }
+    else frac=clamp((i-ph.impact+1)/Math.max(4,end-ph.impact),0.06,1);
+    drawTracer(T.pts,frac,W,H,lw,T.nDet);
+    if(T.landing&&frac>=0.999){ const L={x:T.landing.x*W,y:T.landing.y*H}; octx.save(); octx.strokeStyle=getCss('--tracer'); octx.fillStyle='#fff'; octx.lineWidth=lw*0.8; octx.beginPath(); octx.arc(L.x,L.y,lw*2.2,0,Math.PI*2); octx.fill(); octx.stroke();
       const fs=Math.max(12,W*0.04); octx.font=`bold ${fs}px ${getComputedStyle(document.body).fontFamily}`; const txt=`約${Math.round(T.carryYd)}Y`, tw=octx.measureText(txt).width, tx=clamp(L.x-tw/2,4,W-tw-4), ty=Math.max(fs+4,L.y-lw*3);
       octx.fillStyle='rgba(0,0,0,.6)'; octx.fillRect(tx-6,ty-fs,tw+12,fs+8); octx.fillStyle='#fff'; octx.fillText(txt,tx,ty+2); octx.restore(); } }
   // 局面ラベル
   const lab=Object.entries(PHASE_LABEL).find(([k])=>ph[k]===i);
   if(lab){ octx.font=`bold ${Math.max(13,W*0.045)}px ${getComputedStyle(document.body).fontFamily}`; octx.fillStyle='rgba(0,0,0,.6)'; const tw=octx.measureText(lab[1]).width; octx.fillRect(10,10,tw+16,Math.max(13,W*0.045)+12); octx.fillStyle='#fff'; octx.fillText(lab[1],18,10+Math.max(13,W*0.045)+2); }
 }
+function cumLen(pts,W,H){ const L=[0]; for(let k=1;k<pts.length;k++) L.push(L[k-1]+Math.hypot((pts[k].x-pts[k-1].x)*W,(pts[k].y-pts[k-1].y)*H)); return L; }
 function tracerCached(rec){ const key=`${rec.meta.club}|${rec.ball.x}|${rec.ball.y}|${rec.tracer&&rec.tracer.kind}`; if(!rec._tr||rec._trKey!==key){ rec._tr=buildTracer(rec); rec._trKey=key; } return rec._tr; }
 function drawBall(b,W,H,lw){ if(!b) return; octx.fillStyle='#fff'; octx.strokeStyle=getCss('--tracer'); octx.lineWidth=lw*0.7; octx.beginPath(); octx.arc(b.x*W,b.y*H,lw*2,0,Math.PI*2); octx.fill(); octx.stroke(); }
-function drawTracer(pts,frac,W,H,lw){
+// 追跡できた部分（先頭 nSolid 点）は実線、予測の部分は点線で描く
+function drawTracer(pts,frac,W,H,lw,nSolid){
   if(!pts||pts.length<2) return; const px=pts.map(p=>({x:p.x*W,y:p.y*H})); let tot=0; const seg=[]; for(let k=1;k<px.length;k++){const d=dist(px[k],px[k-1]);seg.push(d);tot+=d;}
-  let rem=tot*frac; octx.save(); octx.strokeStyle=getCss('--tracer'); octx.shadowColor=getCss('--tracer'); octx.shadowBlur=10; octx.lineWidth=lw*1.2; octx.lineCap='round'; octx.lineJoin='round';
-  octx.beginPath(); octx.moveTo(px[0].x,px[0].y);
-  for(let k=1;k<px.length&&rem>0;k++){ const d=seg[k-1]; if(d<=rem){octx.lineTo(px[k].x,px[k].y);rem-=d;} else { const t=rem/d; octx.lineTo(px[k-1].x+(px[k].x-px[k-1].x)*t,px[k-1].y+(px[k].y-px[k-1].y)*t); rem=0; } }
-  octx.stroke(); octx.restore();
+  let rem=tot*frac; const col=getCss('--tracer'); nSolid=nSolid||0;
+  const stroke=(dashed)=>{ octx.setLineDash(dashed?[lw*2.2,lw*1.6]:[]); octx.globalAlpha=dashed?0.9:1; octx.stroke(); };
+  octx.save(); octx.strokeStyle=col; octx.shadowColor=col; octx.shadowBlur=10; octx.lineWidth=lw*1.2; octx.lineCap='round'; octx.lineJoin='round';
+  let dashed=nSolid<2; octx.beginPath(); octx.moveTo(px[0].x,px[0].y);
+  for(let k=1;k<px.length&&rem>0;k++){
+    if(!dashed&&k>nSolid-1){ stroke(false); dashed=true; octx.beginPath(); octx.moveTo(px[k-1].x,px[k-1].y); }
+    const d=seg[k-1]; if(d<=rem){octx.lineTo(px[k].x,px[k].y);rem-=d;} else { const t=rem/d; octx.lineTo(px[k-1].x+(px[k].x-px[k-1].x)*t,px[k-1].y+(px[k].y-px[k-1].y)*t); rem=0; } }
+  stroke(dashed); octx.restore();
 }
 function getCss(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim()||'#E2412A'; }
 
@@ -721,7 +775,7 @@ function renderResult(){
   $('mHand').innerHTML=`${fmt(r.speed.hand,1)}<small>m/s</small>`;
   $('mTempo').innerHTML=`${fmt(r.tempo,1)}<small>：1</small>`;
   $('mTracer').textContent=rec.tracer.kind==='detected'?'検出＋予測':'予測ライン';
-  $('mTracerS').textContent=(rec.tracer.kind==='detected'?'打ち出し直後を追跡し、その先を予測':'ボールを追えなかったため予測で表示')+(rec.meta.view==='dtl'?'・落下地点まで表示':'・落下地点は下の弾道図で表示');
+  $('mTracerS').textContent=(rec.tracer.kind==='detected'?`実線＝追跡できた${rec.tracer.pts.length-1}コマ、点線＝その先の予測`:'ボールを追えなかったため、点線の予測で表示')+(rec.meta.view==='dtl'?'・落下地点まで表示':'・落下地点は下の弾道図で表示');
   renderFlight(rec);
   const ph=$('phases'); ph.innerHTML='';
   for(const [k,l] of Object.entries(PHASE_LABEL)){ const b=document.createElement('button'); b.type='button'; b.innerHTML=`${l}<b>${fmt(rec.frames[r.phases[k]].tr,2)}秒</b>`; b.addEventListener('click',()=>{stopPlay();gotoIdx(r.phases[k]);}); ph.appendChild(b); }
