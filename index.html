@@ -26,6 +26,7 @@
   color-scheme:dark;
 }
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 body{background:var(--bg);color:var(--ink);font-family:var(--font);font-size:15px;line-height:1.6;padding:0 16px}
 .app{max-width:720px;margin:0 auto;padding-block:20px 48px;display:flex;flex-direction:column;gap:16px}
 h1,h2,h3{margin:0;text-wrap:balance;line-height:1.3}
@@ -139,6 +140,9 @@ footer{font-size:12px;color:var(--muted);text-align:center}
       <label class="field" for="slow">動画の速さ
         <select id="slow"><option value="1" selected>通常の速さ</option><option value="4">4倍スロー再生の動画</option><option value="8">8倍スロー再生の動画</option></select>
       </label>
+      <label class="field" for="club">使ったクラブ
+        <select id="club"><option value="D" selected>ドライバー</option><option value="W3">3番ウッド</option><option value="UT">ユーティリティ</option><option value="I5">5番アイアン</option><option value="I7">7番アイアン</option><option value="I9">9番アイアン</option><option value="PW">ピッチングウェッジ</option></select>
+      </label>
       <label class="field" for="cx">骨格検出の精度
         <select id="cx"><option value="0">標準（速い）</option><option value="1" selected>高（少し遅い）</option></select>
       </label>
@@ -188,6 +192,7 @@ footer{font-size:12px;color:var(--muted);text-align:center}
       <div><div class="grade" id="grade"></div><div id="advice"></div></div>
     </div>
     <div class="metrics">
+      <div class="metric"><div class="k">推定飛距離</div><div class="v" id="mCarry">--</div><div class="s" id="mCarryS"></div></div>
       <div class="metric"><div class="k">推定ヘッドスピード</div><div class="v" id="mHead">--</div><div class="s">手元の速さからの目安</div></div>
       <div class="metric"><div class="k">手元の最大速度</div><div class="v" id="mHand">--</div><div class="s">ダウンスイング中</div></div>
       <div class="metric"><div class="k">テンポ（バック：ダウン）</div><div class="v" id="mTempo">--</div><div class="s">目安は 3：1</div></div>
@@ -201,7 +206,7 @@ footer{font-size:12px;color:var(--muted);text-align:center}
   <section class="card" aria-labelledby="h-hist">
     <div class="row"><h2 id="h-hist">履歴（最新5件）</h2><span class="spacer"></span><span class="badge" id="histCount"></span></div>
     <ul class="hist" id="hist"></ul>
-    <p class="empty" id="histNote">解析した結果はこの端末のブラウザに自動保存されます。6件目を保存すると一番古い記録が消えます。動画そのものは保存せず、骨格データとアドレス時の静止画を保存します。</p>
+    <p class="empty" id="histNote">解析した結果はこの端末のブラウザに自動保存されます。6件目を保存すると一番古い記録が消えます。動画も一緒に保存するので、あとから映像と骨格を重ねて見直せます（端末の空き容量が足りないときは、骨格データと静止画だけを保存します）。</p>
   </section>
 
   <footer>スイングスピードと弾道ラインは映像から計算した推定値です。弾道計測器の数値とは一致しません。</footer>
@@ -307,6 +312,19 @@ function analyze(frames, meta){
   return {phases:{address,start,top,impact,finish},items,total,speed:{hand,head},tempo:ratio,notes,torso};
 }
 
+// ---------- 推定飛距離 ----------
+// k：芯で当たったときの「ヘッドスピード1m/sあたりのヤード数」の目安
+const CLUBS={D:{name:'ドライバー',k:5.3},W3:{name:'3番ウッド',k:5.0},UT:{name:'ユーティリティ',k:4.6},I5:{name:'5番アイアン',k:4.5},I7:{name:'7番アイアン',k:4.2},I9:{name:'9番アイアン',k:3.8},PW:{name:'ピッチングウェッジ',k:3.4}};
+function computeCarry(res,clubKey){
+  const c=CLUBS[clubKey]||CLUBS.D;
+  const g=k=>{const it=res.items.find(i=>i.key===k);return it&&it.score!=null?it.score:70;};
+  // インパクトの質：体軸の維持・頭の安定・テンポから計算（芯を外すほど飛ばなくなる）
+  const quality=Math.round(0.4*g('axis')+0.3*g('head')+0.3*g('tempo'));
+  const eff=0.8+0.2*quality/100;
+  const yd=res.speed.head*c.k*eff;
+  return {yd,lo:yd*0.92,hi:yd*1.08,quality,club:c.name};
+}
+
 // ---------- 弾道ライン ----------
 function defaultBall(frames, meta, idx){
   const f=frames[idx]; const q=k=>f.p[KI[k]];
@@ -398,18 +416,18 @@ function seek(v,t){
 const DB={db:null,mem:[]};
 function dbOpen(){ return new Promise(res=>{ try{ const rq=indexedDB.open('swing-lab',1); rq.onupgradeneeded=()=>rq.result.createObjectStore('shots',{keyPath:'id'}); rq.onsuccess=()=>{DB.db=rq.result;res();}; rq.onerror=()=>res(); }catch(e){res();} }); }
 function dbAll(){ if(!DB.db) return Promise.resolve(DB.mem.slice()); return new Promise(res=>{ try{ const rq=DB.db.transaction('shots','readonly').objectStore('shots').getAll(); rq.onsuccess=()=>res(rq.result||[]); rq.onerror=()=>res(DB.mem.slice()); }catch(e){res(DB.mem.slice());} }); }
-function dbPut(r){ DB.mem=DB.mem.filter(x=>x.id!==r.id).concat(r); if(!DB.db) return Promise.resolve(); return new Promise(res=>{ try{ const tx=DB.db.transaction('shots','readwrite'); tx.objectStore('shots').put(r); tx.oncomplete=()=>res(); tx.onerror=()=>res(); }catch(e){res();} }); }
+function dbPut(r){ DB.mem=DB.mem.filter(x=>x.id!==r.id).concat(r); if(!DB.db) return Promise.resolve(true); return new Promise(res=>{ try{ const tx=DB.db.transaction('shots','readwrite'); tx.objectStore('shots').put(r); tx.oncomplete=()=>res(true); tx.onerror=()=>res(false); tx.onabort=()=>res(false); }catch(e){res(false);} }); }
 function dbDel(id){ DB.mem=DB.mem.filter(x=>x.id!==id); if(!DB.db) return Promise.resolve(); return new Promise(res=>{ try{ const tx=DB.db.transaction('shots','readwrite'); tx.objectStore('shots').delete(id); tx.oncomplete=()=>res(); tx.onerror=()=>res(); }catch(e){res();} }); }
-async function saveRecord(rec){ await dbPut(rec); const all=(await dbAll()).sort((a,b)=>b.date-a.date); for(const old of all.slice(KEEP)) await dbDel(old.id); }
+async function saveRecord(rec){ let ok=await dbPut(rec); if(!ok&&rec.video){ delete rec.video; rec.noVideo=true; ok=await dbPut(rec); } const all=(await dbAll()).sort((a,b)=>b.date-a.date); for(const old of all.slice(KEEP)) await dbDel(old.id); }
 
 // ---------- 状態 ----------
 const S={mode:'record',rec:null,video:{url:null,range:[0,0],ball:null,meta:null},cur:0,playing:false,busy:false};
 const vid=$('vid'), thumb=$('thumb'), ov=$('ov'), stage=$('stage'), seekEl=$('seek');
 const octx=ov.getContext('2d');
 
-function settings(){ return {hand:$('handL').checked?'L':'R',view:$('viewD').checked?'dtl':'face',heightCm:clamp(+$('height').value||170,120,210),fps:+$('fps').value,slow:+$('slow').value,cx:+$('cx').value}; }
+function settings(){ return {hand:$('handL').checked?'L':'R',view:$('viewD').checked?'dtl':'face',heightCm:clamp(+$('height').value||170,120,210),fps:+$('fps').value,slow:+$('slow').value,cx:+$('cx').value,club:$('club').value}; }
 function saveSettings(){ try{localStorage.setItem('swing-settings',JSON.stringify(settings()));}catch(e){} }
-function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('swing-settings')||'null'); if(!s) return; $(s.hand==='L'?'handL':'handR').checked=true; $(s.view==='dtl'?'viewD':'viewF').checked=true; $('height').value=s.heightCm; $('fps').value=s.fps; $('slow').value=s.slow; $('cx').value=s.cx; }catch(e){} }
+function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('swing-settings')||'null'); if(!s) return; $(s.hand==='L'?'handL':'handR').checked=true; $(s.view==='dtl'?'viewD':'viewF').checked=true; $('height').value=s.heightCm; $('fps').value=s.fps; $('slow').value=s.slow; $('cx').value=s.cx; if(s.club) $('club').value=s.club; }catch(e){} }
 
 function setAspect(w,h){ stage.style.aspectRatio=`${w} / ${h}`; stage.style.width=`min(100%, calc(64vh * ${w/h}))`; requestAnimationFrame(()=>{sizeCanvas();draw();}); }
 function sizeCanvas(){ const r=stage.getBoundingClientRect(), d=window.devicePixelRatio||1; ov.width=Math.max(1,Math.round(r.width*d)); ov.height=Math.max(1,Math.round(r.height*d)); octx.setTransform(d,0,0,d,0,0); }
@@ -477,12 +495,15 @@ function gotoIdx(i){ const fr=framesNow(); if(!fr.length) return; S.cur=clamp(i,
 
 function renderResult(){
   const rec=S.rec;
-  if(!rec){ $('total').textContent='--'; $('grade').textContent='まだ解析していません'; $('advice').textContent='動画を読み込んで「解析する」を押すと結果が表示されます。'; ['mHead','mHand','mTempo','mTracer'].forEach(i=>$(i).textContent='--'); $('mTracerS').textContent=''; $('phases').innerHTML=''; $('items').innerHTML=''; $('notes').textContent=''; return; }
+  if(!rec){ $('total').textContent='--'; $('grade').textContent='まだ解析していません'; $('advice').textContent='動画を読み込んで「解析する」を押すと結果が表示されます。'; ['mCarry','mHead','mHand','mTempo','mTracer'].forEach(i=>$(i).textContent='--'); $('mTracerS').textContent=''; $('mCarryS').textContent=''; $('phases').innerHTML=''; $('items').innerHTML=''; $('notes').textContent=''; return; }
   const r=rec.res;
   $('total').textContent=r.total;
   $('grade').textContent=r.total>=85?'とても良いスイングです':r.total>=70?'良いスイングです':r.total>=55?'あと一歩です':'改善の余地があります';
   const worst=r.items.filter(i=>i.score!=null).sort((a,b)=>a.score-b.score)[0];
   $('advice').textContent=worst&&worst.score<80?`次の練習ポイント：${worst.label}。${worst.comment}`:'大きな欠点は見つかりませんでした。この形を安定させましょう。';
+  const cr=computeCarry(r,rec.meta.club||'D');
+  $('mCarry').innerHTML=`約${Math.round(cr.yd)}<small>ヤード</small>`;
+  $('mCarryS').textContent=`${cr.club}・${Math.round(cr.lo)}〜${Math.round(cr.hi)}yd・インパクトの質 ${cr.quality}点`;
   $('mHead').innerHTML=`${fmt(r.speed.head,1)}<small>m/s</small>`;
   $('mHand').innerHTML=`${fmt(r.speed.hand,1)}<small>m/s</small>`;
   $('mTempo').innerHTML=`${fmt(r.tempo,1)}<small>：1</small>`;
@@ -503,23 +524,34 @@ async function renderHistory(){
   for(const rec of list){
     const li=document.createElement('li'); if(S.rec&&S.rec.id===rec.id) li.className='active';
     const d=new Date(rec.date);
-    li.innerHTML=`<button type="button" class="open"><img alt=""><span class="meta"><b>${rec.res.total} 点</b><div></div><div>推定ヘッドスピード ${fmt(rec.res.speed.head,1)} m/s</div></span></button>`;
+    li.innerHTML=`<button type="button" class="open"><img alt=""><span class="meta"><b>${rec.res.total} 点</b><div></div><div>推定 約${Math.round(computeCarry(rec.res,rec.meta.club||'D').yd)}ヤード・ヘッドスピード ${fmt(rec.res.speed.head,1)} m/s</div></span></button>`;
     li.querySelector('img').src=rec.thumb;
     li.querySelector('.meta div').textContent=rec.sample?'サンプル（保存されません）':`${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}・${rec.meta.view==='face'?'正面':'後方'}・${rec.meta.hand==='R'?'右打ち':'左打ち'}`;
     li.querySelector('.open').addEventListener('click',()=>openRecord(rec));
     if(!rec.sample){ const del=document.createElement('button'); del.type='button'; del.className='btn ghost danger'; del.textContent='削除'; let armed=false,tm=null;
-      del.addEventListener('click',async()=>{ if(!armed){armed=true;del.textContent='もう一度押して削除';tm=setTimeout(()=>{armed=false;del.textContent='削除';},3000);return;} clearTimeout(tm); await dbDel(rec.id); if(S.rec&&S.rec.id===rec.id&&S.mode==='record') openRecord(SAMPLE); renderHistory(); });
+      del.addEventListener('click',async()=>{ if(!armed){armed=true;del.textContent='もう一度押して削除';tm=setTimeout(()=>{armed=false;del.textContent='削除';},3000);return;} clearTimeout(tm); await dbDel(rec.id); if(S.rec&&S.rec.id===rec.id) openRecord(SAMPLE); renderHistory(); });
       li.appendChild(del); }
     ul.appendChild(li);
   }
 }
-function openRecord(rec){
-  stopPlay(); S.mode='record'; S.rec=rec; S.cur=rec.res.phases.address;
-  vid.hidden=true; vid.pause(); thumb.hidden=false; thumb.src=rec.thumb;
+function waitMeta(){ return new Promise(res=>{ if(vid.readyState>=1) return res(); const on=()=>{vid.removeEventListener('loadedmetadata',on);res();}; vid.addEventListener('loadedmetadata',on); setTimeout(res,5000); }); }
+async function openRecord(rec){
+  stopPlay(); S.rec=rec; S.cur=rec.res.phases.address; S.video.file=null;
   $('modeBadge').textContent=rec.sample?'サンプル表示中':'保存した記録'; $('modeBadge').className='badge'+(rec.sample?' sample':'');
-  $('hint').textContent=rec.sample?'いまは練習用のサンプルを表示しています。「動画を選ぶ」から自分のスイング動画を読み込んでください。':'保存した記録では、アドレス時の静止画の上に骨格の動きを再生します。';
   $('run').disabled=true; $('setStart').disabled=true; $('setEnd').disabled=true;
-  setAspect(rec.meta.vw,rec.meta.vh); setSlider(); updateTime(); renderResult(); renderHistory(); draw();
+  if(rec.video){
+    S.mode='video'; if(S.video.url) URL.revokeObjectURL(S.video.url);
+    S.video.url=URL.createObjectURL(rec.video); S.video.range=[rec.frames[0].tm,rec.frames[rec.frames.length-1].tm];
+    thumb.hidden=true; vid.hidden=false; vid.src=S.video.url; vid.load();
+    await waitMeta(); if(S.rec!==rec) return;
+    try{ await vid.play(); vid.pause(); }catch(e){}
+    await seek(vid,rec.frames[S.cur].tm);
+    $('hint').textContent='保存した動画に骨格と弾道ラインを重ねて表示しています。「再生」を押すと0.5倍速で再生します。';
+  } else {
+    S.mode='record'; vid.hidden=true; vid.pause(); thumb.hidden=false; thumb.src=rec.thumb;
+    $('hint').textContent=rec.sample?'いまは練習用のサンプルを表示しています（サンプルには映像がないため骨格だけが動きます）。「動画を選ぶ」から自分のスイング動画を読み込んでください。':'この記録は動画が保存されていないため、アドレス時の静止画の上に骨格の動きだけを再生します。';
+  }
+  setAspect(rec.meta.vw,rec.meta.vh); setSlider(); if(S.mode==='video') seekEl.value=vid.currentTime; updateTime(); renderResult(); renderHistory(); draw();
 }
 
 // ---------- 再生 ----------
@@ -527,13 +559,18 @@ let raf=0,playT0=0,playTm0=0;
 function stopPlay(){ S.playing=false; cancelAnimationFrame(raf); if(S.mode==='video') vid.pause(); $('play').textContent='再生'; }
 function loop(){
   if(!S.playing) return;
-  if(S.mode==='video'){ seekEl.value=vid.currentTime; if(S.rec) S.cur=nearestIdx(vid.currentTime); updateTime(); draw(); if(vid.ended||vid.paused){stopPlay();return;} }
+  if(S.mode==='video'){ seekEl.value=vid.currentTime; if(S.rec) S.cur=nearestIdx(vid.currentTime); updateTime(); draw(); const fr=framesNow(); if(vid.ended||vid.paused||(S.rec&&fr.length&&vid.currentTime>=fr[fr.length-1].tm)){stopPlay();return;} }
   else { const fr=framesNow(); const tm=playTm0+(performance.now()-playT0)/1000*(fr[fr.length-1].tm-fr[0].tm>4?1:0.5); S.cur=nearestIdx(tm); seekEl.value=S.cur; updateTime(); draw(); if(S.cur>=fr.length-1){stopPlay();return;} }
   raf=requestAnimationFrame(loop);
 }
 $('play').addEventListener('click',()=>{
   if(S.playing){stopPlay();return;}
-  if(S.mode==='video'){ if(!vid.src) return; vid.playbackRate=S.rec?0.5:1; vid.play().catch(()=>{}); }
+  if(S.mode==='video'){ if(!vid.src) return;
+    const fr=framesNow();
+    if(S.rec&&fr.length&&(vid.currentTime>=fr[fr.length-1].tm-0.01||vid.currentTime<fr[0].tm)) vid.currentTime=fr[0].tm;
+    vid.playbackRate=S.rec?0.5:1; S.playing=true; $('play').textContent='一時停止';
+    vid.play().then(()=>{ if(S.playing) raf=requestAnimationFrame(loop); }).catch(()=>{ stopPlay(); $('status').textContent='動画を再生できませんでした。もう一度「再生」を押してください。'; });
+    return; }
   else { const fr=framesNow(); if(!fr.length) return; if(S.cur>=fr.length-1) S.cur=0; playT0=performance.now(); playTm0=fr[S.cur].tm; }
   S.playing=true; $('play').textContent='一時停止'; raf=requestAnimationFrame(loop);
 });
@@ -544,7 +581,7 @@ vid.addEventListener('seeked',()=>{ if(!S.busy){ updateTime(); draw(); } });
 $('file').addEventListener('change',e=>{
   const file=e.target.files&&e.target.files[0]; if(!file) return;
   stopPlay(); if(S.video.url) URL.revokeObjectURL(S.video.url);
-  S.video.url=URL.createObjectURL(file); S.mode='video'; S.rec=null; S.video.ball=null;
+  S.video.url=URL.createObjectURL(file); S.video.file=file; S.mode='video'; S.rec=null; S.video.ball=null;
   thumb.hidden=true; vid.hidden=false; vid.src=S.video.url; vid.load();
   $('modeBadge').textContent='読み込んだ動画'; $('modeBadge').className='badge';
   $('status').textContent='動画を読み込んでいます…';
@@ -561,12 +598,12 @@ $('file').addEventListener('change',e=>{
 $('setStart').addEventListener('click',()=>{ S.video.range[0]=Math.min(vid.currentTime,S.video.range[1]-0.3); updateTime(); });
 $('setEnd').addEventListener('click',()=>{ S.video.range[1]=Math.max(vid.currentTime,S.video.range[0]+0.3); updateTime(); });
 ov.addEventListener('click',e=>{ if(S.mode!=='video'||S.busy||!vid.src||S.rec) return; const r=ov.getBoundingClientRect(); S.video.ball={x:(e.clientX-r.left)/r.width,y:(e.clientY-r.top)/r.height,auto:false}; $('status').textContent='ボールの位置を設定しました'; draw(); });
-['handR','handL','viewF','viewD','height','fps','slow','cx'].forEach(id=>$(id).addEventListener('change',saveSettings));
+['handR','handL','viewF','viewD','height','fps','slow','cx','club'].forEach(id=>$(id).addEventListener('change',saveSettings));
 
 // ---------- 解析 ----------
 $('run').addEventListener('click',async()=>{
   if(S.busy||!vid.src) return; stopPlay(); S.busy=true;
-  const s=settings(), [t0,t1]=S.video.range; const meta={vw:vid.videoWidth,vh:vid.videoHeight,hand:s.hand,view:s.view,heightCm:s.heightCm,fps:s.fps,slow:s.slow};
+  const s=settings(), [t0,t1]=S.video.range; const meta={vw:vid.videoWidth,vh:vid.videoHeight,hand:s.hand,view:s.view,heightCm:s.heightCm,fps:s.fps,slow:s.slow,club:s.club};
   const btns=['run','setStart','setEnd','play','file']; btns.forEach(b=>$(b).disabled=true);
   $('prog').hidden=false; $('progBar').style.width='0%';
   try{
@@ -593,10 +630,10 @@ $('run').addEventListener('click',async()=>{
     const tracer=tpts?{kind:'detected',pts:tpts}:{kind:'estimated',pts:estTracer(ball,meta)};
     await seek(vid,frames[res.phases.address].tm);
     const tc=document.createElement('canvas'); tc.width=360; tc.height=Math.round(360*meta.vh/meta.vw); tc.getContext('2d').drawImage(vid,0,0,tc.width,tc.height);
-    const rec={id:Date.now(),date:Date.now(),meta,frames,res,ball,tracer,thumb:tc.toDataURL('image/jpeg',0.72)};
+    const rec={id:Date.now(),date:Date.now(),meta,frames,res,ball,tracer,thumb:tc.toDataURL('image/jpeg',0.72),video:S.video.file||null};
     await saveRecord(rec);
     S.rec=rec; S.cur=res.phases.address; $('progBar').style.width='100%';
-    $('status').textContent='解析が終わり、履歴に保存しました';
+    $('status').textContent=rec.noVideo?'解析が終わり、履歴に保存しました（空き容量が足りないため動画は保存していません）':'解析が終わり、動画と一緒に履歴に保存しました';
     setSlider(); seekEl.value=vid.currentTime; renderResult(); renderHistory(); updateTime(); draw();
     $('hint').textContent='「再生」を押すと0.5倍速で骨格と弾道ラインを重ねて再生します。結果の局面ボタンで各場面に移動できます。';
   }catch(err){
@@ -630,7 +667,7 @@ function makeSample(){
     const P={nose,ls,rs,le,re,lw:{x:hand.x+6,y:hand.y},rw:{x:hand.x-6,y:hand.y+8},lh,rh,lk,rk,la,ra};
     frames.push({tm:r4(t),tr:r4(t),p:KEYS.map(k=>[r4((P[k].x+rnd())/vw),r4((P[k].y+rnd())/vh),0.99])});
   }
-  const meta={vw,vh,hand:'R',view:'face',heightCm:170,fps,slow:1};
+  const meta={vw,vh,hand:'R',view:'face',heightCm:170,fps,slow:1,club:'D'};
   const res=analyze(frames,meta);
   const ball={x:0.5,y:0.905,auto:true};
   // 背景画像（練習場のイメージ）
