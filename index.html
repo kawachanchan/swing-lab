@@ -418,22 +418,57 @@ const CLUB_FLIGHT={D:{apex:28,carry:210},W3:{apex:26,carry:190},UT:{apex:25,carr
 const flightShape=s=>s*(1-s*s*s), FLIGHT_MAX=flightShape(Math.cbrt(0.25));
 function flightOf(rec){ const club=rec.meta.club||'D', fl=CLUB_FLIGHT[club]||CLUB_FLIGHT.D, carryYd=computeCarry(rec.res,club).yd; return {carryYd,D:carryYd*0.9144,apex:fl.apex*clamp(carryYd/fl.carry,0.5,1.2)}; }
 // 映像に重ねる弾道ライン。後方撮影は遠近法で落下地点まで描く。正面撮影は画面の外へ飛んでいく
-function buildTracer(rec){
-  const meta=rec.meta, b=rec.ball, W=meta.vw, H=meta.vh, dir=meta.hand==='R'?1:-1, det=rec.tracer&&rec.tracer.kind==='detected'?rec.tracer.pts:null;
-  if(meta.view!=='dtl'){ if(det&&det.length>=3){ const sp=extendFace(det,b,meta); return {pts:sp.pts,nDet:sp.nDet,det,landing:null}; } return {pts:estTracer(b,meta),nDet:0,landing:null}; }
-  const fl=flightOf(rec), B={x:b.x*W,y:b.y*H};
-  // カメラは手元の高さにあるとみなし、アドレス時の手元の高さを地平線とする
+// 体の範囲：その時刻の骨格の線を太らせた形（W,Hはピクセルの大きさ、torsoは胴の長さのピクセル）
+function makeBodyAt(frames,W,H,torso){
+  return t=>{ let lo=0,hi=frames.length-1; while(lo<hi){ const m2=(lo+hi)>>1; if(frames[m2].tm<t) lo=m2+1; else hi=m2; } const p=frames[lo].p;
+    const Q=k=>({x:p[KI[k]][0]*W,y:p[KI[k]][1]*H}); const caps=[];
+    for(const [a,b] of EDGES){ const leg=a[1]==='h'||a[1]==='k'; caps.push([Q(a),Q(b),torso*(leg?0.14:0.11)]); }
+    caps.push([mid(Q('ls'),Q('rs')),mid(Q('lh'),Q('rh')),torso*0.28]); caps.push([Q('nose'),Q('nose'),torso*0.26]);
+    // 手元から先（クラブ）の分として、前腕の延長を少し含める
+    for(const sd of ['l','r']){ const e=Q(sd+'e'), w2=Q(sd+'w'), dx=w2.x-e.x, dy=w2.y-e.y, n=Math.hypot(dx,dy)||1; caps.push([w2,{x:w2.x+dx/n*torso*0.5,y:w2.y+dy/n*torso*0.5},torso*0.1]); }
+    return (x,y,grow)=>caps.some(([a,b,r2])=>{ const ux=b.x-a.x, uy=b.y-a.y, L2=ux*ux+uy*uy; const tt=L2?clamp(((x-a.x)*ux+(y-a.y)*uy)/L2,0,1):0; return Math.hypot(x-a.x-ux*tt,y-a.y-uy*tt)<r2*(grow||1); }); };
+}
+// 後方撮影の弾道モデル（遠近法）。追跡と予測の両方で使う
+// 左右のずれ = 打ち出し方向（a） ＋ 曲がり（b）。右打ちを後方から見て、bがマイナスなら左へ、プラスなら右へ曲がる
+function dtlModel(rec){
+  const meta=rec.meta, bl=rec.ball, W=meta.vw, H=meta.vh, fl=flightOf(rec), B={x:bl.x*W,y:bl.y*H};
+  // カメラは手元の高さにあるとみなし、アドレス時の手元の高さを地平線とする。カメラは飛球線と平行に向いているとみなす
   const f0=rec.frames[rec.res.phases.address].p; let horizon=(f0[KI.lw][1]+f0[KI.rw][1])/2*H;
   if(B.y-horizon<0.12*H) horizon=B.y-0.3*H;
-  const camH=1.0, camBack=3.0, fpx=(B.y-horizon)*camBack/camH;
-  // カメラは飛球線と平行に向いているとみなし、飛球線は画面中央の消失点に向かって細くなる
-  const cx=W/2, Xb=(B.x-cx)*camBack/fpx;
-  const make=side=>{ const lateral=fl.D*0.08*side, arr=[]; for(let k=0;k<=60;k++){ const s=k/60, Z=fl.D*s, Y=fl.apex*flightShape(s)/FLIGHT_MAX, X=Xb+lateral*s*s, depth=Z+camBack; arr.push({x:(cx+fpx*X/depth)/W,y:(horizon-fpx*(Y-camH)/depth)/H}); } return arr; };
-  // 追跡できた点があれば、それに一番合う左右の曲がり具合を選ぶ
-  let side=0; if(det&&det.length>=3){ let best=1e18; for(let sd=-1.5; sd<=1.5001; sd+=0.1){ const m=make(sd); let e=0; for(const q of det){ let md=1e18; for(const p2 of m){ const d=((p2.x-q.x)*W)**2+((p2.y-q.y)*H)**2; if(d<md) md=d; } e+=md; } if(e<best){best=e; side=sd;} } }
-  const pts=make(side);
-  if(det&&det.length>=3){ const sp=splice(det,pts); return {pts:sp.pts,nDet:sp.nDet,det,landing:sp.pts[sp.pts.length-1],carryYd:fl.carryYd}; }
-  return {pts,nDet:0,landing:pts[pts.length-1],carryYd:fl.carryYd};
+  const camH=1.0, camBack=3.0, fpx=(B.y-horizon)*camBack/camH, cx=W/2, Xb=(B.x-cx)*camBack/fpx;
+  const at=(s,a,b)=>{ const Z=fl.D*s, Y=fl.apex*flightShape(s)/FLIGHT_MAX, X=Xb+fl.D*(a*s+b*s*s), depth=Z+camBack; return {x:(cx+fpx*X/depth)/W,y:(horizon-fpx*(Y-camH)/depth)/H}; };
+  const make=(a,b)=>{ const arr=[]; for(let k=0;k<=60;k++) arr.push(at(k/60,a,b)); return arr; };
+  // 飛んだ距離の時間変化（空気抵抗で少しずつ遅くなる）。v0=打ち出し直後の速さ[m/s]
+  const TAU=4, sAt=(tr,v0)=>clamp(v0*TAU*(1-Math.exp(-tr/TAU))/fl.D,0,1);
+  // 追跡した点（時刻つき）に一番合う a, b, v0 を探す。曲がりは早い段階の点だけでは決めにくいので、大きな曲がりほど少し不利にする
+  // 追跡した点（時刻つき）に一番合う a, b, v0 と、打ち出し時刻のずれ dt を探す。曲がりは早い段階の点だけでは決めにくいので、大きな曲がりほど少し不利にする
+  const fit=(det,slow,unseen)=>{
+    const d=det.slice(1); if(!d.length) return {a:0,b:0,v0:60,dt:0};
+    const hasT=d.every(q=>q.tm!=null), t0=det[0].tm, sl=slow||1, sc=(W*W+H*H)*1e-6;
+    // 見えなかった時刻：その時刻にボールが体の外（見える場所）にあるはずの曲がり方は、見落としたことになるので不利にする
+    const f0p=rec.frames[rec.res.phases.address].p, torsoPx=Math.hypot(((f0p[KI.ls][0]+f0p[KI.rs][0])-(f0p[KI.lh][0]+f0p[KI.rh][0]))/2*W,((f0p[KI.ls][1]+f0p[KI.rs][1])-(f0p[KI.lh][1]+f0p[KI.rh][1]))/2*H)||H*0.2;
+    const U=(unseen||[]).slice(0,20), bodyAtU=U.length?makeBodyAt(rec.frames,W,H,torsoPx):null, masks=U.map(t=>bodyAtU(t)), PEN=(dBallPx()*4)**2;
+    function dBallPx(){ const nz=f0p[KI.nose], la=f0p[KI.la], ra=f0p[KI.ra]; const body=Math.hypot((nz[0]-(la[0]+ra[0])/2)*W,(nz[1]-(la[1]+ra[1])/2)*H)||H*0.6; return 0.0427/((meta.heightCm/100*0.88)/body); }
+    const err=(a,b,v0,dt)=>{ let e=0; for(const q of d){ const m=at(sAt(Math.max(0,(q.tm-t0)/sl+dt),v0),a,b); e+=((m.x-q.x)*W)**2+((m.y-q.y)*H)**2; }
+      let pe=0; for(let i=0;i<U.length;i++){ const m=at(sAt(Math.max(0,(U[i]-t0)/sl+dt),v0),a,b), x=m.x*W, y=m.y*H; if(x>0&&x<W&&y>0&&y<H&&!masks[i](x,y,1.3)) pe+=PEN; }
+      return (e+pe*0.5)/d.length+sc*(b*b*30+a*a*10); };
+    if(!hasT){ let best=1e18, r={a:0,b:0,v0:60,dt:0}; for(let a=-0.12;a<=0.1201;a+=0.01) for(let b=-0.4;b<=0.4001;b+=0.025){ const m=make(a,b); let e=0; for(const q of d){ let md=1e18; for(const p2 of m){ const dd=((p2.x-q.x)*W)**2+((p2.y-q.y)*H)**2; if(dd<md) md=dd; } e+=md; } e=e/d.length+sc*(b*b*30+a*a*10); if(e<best){best=e; r={a,b,v0:60,dt:0};} } return r; }
+    // 粗く探してから、細かく詰める
+    let best=1e18, r={a:0,b:0,v0:60,dt:0};
+    for(const v0 of [35,45,55,65,75]) for(let dt=-0.03;dt<=0.0201;dt+=0.01) for(let a=-0.12;a<=0.1201;a+=0.02) for(let b=-0.4;b<=0.4001;b+=0.05){ const e=err(a,b,v0,dt); if(e<best){best=e; r={a,b,v0,dt};} }
+    for(let it=0;it<3;it++){ const c={...r};
+      for(let v0=c.v0-6;v0<=c.v0+6;v0+=1.5) for(let dt=c.dt-0.01;dt<=c.dt+0.0101;dt+=0.0025){ const e=err(c.a,c.b,v0,dt); if(e<best){best=e; r={...r,v0,dt};} }
+      const c2={...r}; for(let a=c2.a-0.02;a<=c2.a+0.0201;a+=0.005) for(let b=c2.b-0.05;b<=c2.b+0.0501;b+=0.0125){ const e=err(a,b,c2.v0,c2.dt); if(e<best){best=e; r={...r,a,b};} } }
+    return r; };
+  return {fl,at,make,sAt,fit};
+}
+function buildTracer(rec){
+  const meta=rec.meta, b=rec.ball, det=rec.tracer&&rec.tracer.kind==='detected'?rec.tracer.pts:null;
+  if(meta.view!=='dtl'){ if(det&&det.length>=3){ const sp=extendFace(det,b,meta); return {pts:sp.pts,nDet:sp.nDet,det,landing:null}; } return {pts:estTracer(b,meta),nDet:0,landing:null}; }
+  const M=dtlModel(rec), prm=det&&det.length>=3?M.fit(det,meta.slow,rec.tracer.unseen):{a:0,b:0};
+  const pts=M.make(prm.a,prm.b);
+  if(det&&det.length>=3){ const sp=splice(det,pts); return {pts:sp.pts,nDet:sp.nDet,det,landing:sp.pts[sp.pts.length-1],carryYd:M.fl.carryYd,fit:prm}; }
+  return {pts,nDet:0,landing:pts[pts.length-1],carryYd:M.fl.carryYd};
 }
 // 追跡できた点の先に予測ラインをつなぐ。つなぎ目のずれは、落下地点に向かって少しずつ0に戻す
 function splice(det,model){
@@ -479,49 +514,96 @@ async function trackBall(video, frames, res, meta, ball){
   }
   if(tLaunch==null) tLaunch=tImp;
   log(`ボール追跡: 打ち出し ${fmt(tLaunch,3)}秒（骨格から見たインパクト ${fmt(tImp,3)}秒）、ボール直径 約${dBall.toFixed(1)}px`);
+  // 体の範囲：その時刻の骨格の線を太らせた形。ボールが体と重なる間はここで見つかった点を使わない
+  const bodyAt=makeBodyAt(frames,W,H,torso);
+  // 直近の点から、なめらかな曲線（2次式）で先の位置を予測する
+  const extrap=(t)=>{ const q=pts.slice(-6); if(q.length<5) return null; const t0=q[0].tm; const fit=key=>{ let S0=0,S1=0,S2=0,S3=0,S4=0,Y0=0,Y1=0,Y2=0; for(const o of q){ const x=o.tm-t0, y=o[key]; S0++; S1+=x; S2+=x*x; S3+=x*x*x; S4+=x*x*x*x; Y0+=y; Y1+=x*y; Y2+=x*x*y; }
+      const M=[[S4,S3,S2],[S3,S2,S1],[S2,S1,S0]], V=[Y2,Y1,Y0]; const det3=m=>m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])-m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0])+m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]);
+      const D0=det3(M); if(Math.abs(D0)<1e-12) return null; const col=(i)=>M.map((r3,j)=>r3.map((v,k)=>k===i?V[j]:v)); const a=det3(col(0))/D0, b=det3(col(1))/D0, c=det3(col(2))/D0; const x=t-t0; return {v:a*x*x+b*x+c, d:2*a*x+b}; };
+    const fx=fit('x'), fy=fit('y'); if(!fx||!fy) return null;
+    // 最後の速さの向きと逆向きになるような予測（曲線の行き過ぎ）は使わない
+    const L=q[q.length-1], P2=q[q.length-2], vx=L.x-P2.x, vy=L.y-P2.y; if(fx.d*vx+fy.d*vy<=0) return null; return {x:fx.v,y:fy.v}; };
+  // 後方撮影では、弾道モデルに今までの点を当てはめて「その時刻にボールがあるはずの位置」を出す（体の後ろを通る間も使う）
+  const M=meta.view==='dtl'?dtlModel({meta,ball,frames,res}):null; let mfit=null, mfitN=0;
+  const modelPred=t=>{ if(!M||pts.length<2) return null; if(pts.length!==mfitN){ mfit=M.fit(pts.map(q=>({x:q.x/W,y:q.y/H,tm:q.tm})),slow); mfitN=pts.length; }
+    const q=M.at(M.sAt(Math.max(0,(t-pts[0].tm)/slow+mfit.dt),mfit.v0),mfit.a,mfit.b); return {x:q.x*W,y:q.y*H}; };
   // 2) 追跡
   await seek(video,Math.max(0,tLaunch-step)); prev.drawImage(video,0,0,W,H);
-  const pts=[{x:O.x,y:O.y,tm:Math.max(0,tLaunch-step)}]; let miss=0, iter=0, dup=0;
+  const pts=[{x:O.x,y:O.y,tm:Math.max(0,tLaunch-step)}]; let miss=0, iter=0, dup=0, bodyRej=0, hiddenSteps=0, reacq=0, wasHidden=false; const unseen=[];
   const tEnd=Math.min((video.duration||1e9)-0.005, tLaunch+0.8*slow), vmax=80/mpp; // 最大 秒速80m
   const fwd=meta.view==='dtl'?{x:0,y:-1}:(()=>{ const v={x:dir,y:-0.8}, n=Math.hypot(v.x,v.y); return {x:v.x/n,y:v.y/n}; })();
+  // 同じコマかどうかの判定用の小さな画像（コマの間の時刻を読んだときは、前と全く同じ絵になる）
+  const thumbC=document.createElement('canvas'); thumbC.width=64; thumbC.height=Math.max(8,Math.round(64*H/W)); const thumbX=thumbC.getContext('2d',{willReadFrequently:true}); let prevThumb=null;
+  const sameFrame=()=>{ thumbX.drawImage(cur.canvas,0,0,thumbC.width,thumbC.height); const d=thumbX.getImageData(0,0,thumbC.width,thumbC.height).data; let same=!!prevThumb;
+    if(prevThumb){ let sd=0; for(let i=0;i<d.length;i+=4) sd+=Math.abs(d[i]-prevThumb[i])+Math.abs(d[i+1]-prevThumb[i+1]); same=sd<4; } prevThumb=d; return same; };
+  prevThumb=null; { const t2=cur; cur=prev; sameFrame(); cur=t2; }
   for(let t=tLaunch; t<=tEnd&&iter<200; t+=step, iter++){
     await seek(video,t); cur.drawImage(video,0,0,W,H);
+    if(sameFrame()){ dup++; continue; }
     const last=pts[pts.length-1], dtR=Math.max(1e-3,(t-last.tm)/slow);
     // 探す範囲：直前の位置から「そのままの速さで進んだ位置（の1.3倍先）」までの帯。遠ざかって減速しても見失わないようにする
-    let pred, R, segA, segB;
+    let pred, R, segA, segB, fam=null;
     if(pts.length===1){ pred=last; R=Math.max(8*dBall,vmax*dtR*1.2); segA=segB=last; }
     else { const a=pts[pts.length-2], dtp=Math.max(1e-3,(last.tm-a.tm)/slow), vx=(last.x-a.x)/dtp, vy=(last.y-a.y)/dtp;
-      pred={x:last.x+vx*dtR,y:last.y+vy*dtR}; segA=last; segB={x:last.x+vx*dtR*1.3,y:last.y+vy*dtR*1.3};
-      R=Math.max(3*dBall,Math.hypot(vx,vy)*dtR*0.25+4+dBall*Math.min(miss,6)*0.5); }
+      const mp=modelPred(t), q2=mp||extrap(t);
+      pred=q2||{x:last.x+vx*dtR,y:last.y+vy*dtR}; segA=last;
+      // 打ち出し直後（まだ1点しか無い）は速さの見積もりが不確かなので、先の方まで広く探す
+      const ext=pts.length===2&&!mp?2.6:1.3;
+      segB=q2?{x:last.x+(q2.x-last.x)*ext,y:last.y+(q2.y-last.y)*ext}:{x:last.x+vx*dtR*ext,y:last.y+vy*dtR*ext};
+      R=Math.max(3*dBall,Math.hypot(vx,vy)*dtR*(pts.length===2?0.4:0.25)+4+dBall*Math.min(miss,10)*0.5); if(mp&&pts.length===2) R=Math.max(R,6*dBall);
+      // しばらく見失っているときは、直前の位置からではなく予測位置のまわりを探す（体の後ろから出てきたところを拾う）
+      if(mp&&miss>=2){ segA={x:pred.x-(pred.x-last.x)*0.25,y:pred.y-(pred.y-last.y)*0.25}; segB={x:pred.x+(pred.x-last.x)*0.25,y:pred.y+(pred.y-last.y)*0.25}; R=Math.max(4*dBall,R); }
+      // 体の後ろに長く隠れているときは、曲がり方が分からないので「左右どちらにどれだけ曲がっても」ボールがありえる範囲をまとめて探す
+      if(M&&mfit&&miss>=3){ fam=[]; const sN=M.sAt(Math.max(0,(t-pts[0].tm)/slow+mfit.dt),mfit.v0); for(let bb=-0.4;bb<=0.4001;bb+=0.05){ const q=M.at(sN,mfit.a,bb); fam.push({x:q.x*W,y:q.y*H}); }
+        const xs=fam.map(q=>q.x), ys=fam.map(q=>q.y); segA={x:Math.min(...xs),y:Math.min(...ys)}; segB={x:Math.max(...xs),y:Math.max(...ys)}; R=Math.max(5*dBall,R); } else fam=null; }
+    // 隠れているかの判定は、服の分を見込んで骨格より1.6倍太い範囲で行う
+    const inBody=bodyAt(t); let hidden=false; for(let k=0;k<=8&&!hidden;k++){ const u=k/8; hidden=inBody(segA.x+(segB.x-segA.x)*u,segA.y+(segB.y-segA.y)*u,1.6)||inBody(pred.x,pred.y,1.6); }
     if(Math.min(segA.x,segB.x)>W+R||Math.max(segA.x,segB.x)<-R||Math.min(segA.y,segB.y)>H+R||Math.max(segA.y,segB.y)<-R) break; // 画面の外へ出た
     const x0=clamp(Math.floor(Math.min(segA.x,segB.x)-R),0,W-1), y0=clamp(Math.floor(Math.min(segA.y,segB.y)-R),0,H-1), x1=clamp(Math.ceil(Math.max(segA.x,segB.x)+R),0,W-1), y1=clamp(Math.ceil(Math.max(segA.y,segB.y)+R),0,H-1);
     const w=x1-x0+1, h=y1-y0+1; if(w<3||h<3) break;
     const dc=cur.getImageData(x0,y0,w,h).data, dp=prev.getImageData(x0,y0,w,h).data, m=new Uint8Array(w*h), L=new Uint8Array(w*h);
     let tot=0;
     for(let i=0;i<w*h;i++){ const j=i*4, l=lum(dc,j), df=l-lum(dp,j); tot+=Math.abs(df); L[i]=l; const sat=Math.max(dc[j],dc[j+1],dc[j+2])-Math.min(dc[j],dc[j+1],dc[j+2]); m[i]=(df>16&&l>105&&sat<85)?1:0; }
-    if(tot/(w*h)<0.05) dup++;
     // 候補（つながった明るい点のかたまり）
     const cands=[], st=[];
     for(let i=0;i<w*h;i++){ if(!m[i]) continue; let area=0,sx=0,sy=0,sl=0; st.length=0; st.push(i); m[i]=0;
       while(st.length){ const k=st.pop(), x=k%w, y=(k/w)|0; area++; sx+=x; sy+=y; sl+=L[k];
         if(x>0&&m[k-1]){m[k-1]=0;st.push(k-1);} if(x<w-1&&m[k+1]){m[k+1]=0;st.push(k+1);} if(y>0&&m[k-w]){m[k-w]=0;st.push(k-w);} if(y<h-1&&m[k+w]){m[k+w]=0;st.push(k+w);} }
       if(area<1||area>Math.max(16,A*10)) continue;
-      cands.push({x:x0+sx/area,y:y0+sy/area,area,l:sl/area}); }
+      const cxp=x0+sx/area, cyp=y0+sy/area; if(inBody(cxp,cyp)){ bodyRej++; continue; } // 体（腕・クラブ・シャツ）の動きは除外
+      cands.push({x:cxp,y:cyp,area,l:sl/area}); }
     let pick=null;
     if(pts.length===1){ let best=-1e9;
       for(const c of cands){ const vx=c.x-O.x, vy=c.y-O.y, d=Math.hypot(vx,vy); if(d<dBall*0.8) continue; const al=(vx*fwd.x+vy*fwd.y)/d; if(al<0.2) continue;
         const sc2=al+c.l/255-Math.abs(Math.log(Math.max(1,c.area)/Math.max(1,A)))*0.15; if(sc2>best){best=sc2;pick=c;} } }
+    else if(fam){ let bd=1e9; const dl=dist(last,O);
+      for(const c of cands){ if(dist(c,O)<=dl) continue; let md=1e9; for(let k=1;k<fam.length;k++){ const a2=fam[k-1], b2=fam[k], ux=b2.x-a2.x, uy=b2.y-a2.y, L2=ux*ux+uy*uy||1, tt=clamp(((c.x-a2.x)*ux+(c.y-a2.y)*uy)/L2,0,1); md=Math.min(md,Math.hypot(c.x-a2.x-ux*tt,c.y-a2.y-uy*tt)); }
+        const sizeOk=c.area<=A*3; /* 遠ざかると小さくなるので、大きすぎるものだけ除く */ if(md<R&&sizeOk&&md<bd){bd=md;pick=c;} }
+      if(pick) reacq++; }
     else { let bd=1e9; const dl=dist(last,O);
       const segD=c=>{ const ux=segB.x-segA.x, uy=segB.y-segA.y, L2=ux*ux+uy*uy||1, t2=clamp(((c.x-segA.x)*ux+(c.y-segA.y)*uy)/L2,0,1); return {d:Math.hypot(c.x-segA.x-ux*t2,c.y-segA.y-uy*t2),t:t2}; };
       for(const c of cands){ const q=segD(c); if(q.d<R&&q.t>0.05&&dist(c,O)>dl+dBall*0.2){ const score=q.d+Math.abs(q.t-0.77)*R*0.3; if(score<bd){bd=score;pick=c;} } } }
-    if(pick){ pts.push({x:pick.x,y:pick.y,tm:t}); miss=0; }
-    else { miss++; // 見失っても、実際の時間で0.12秒（打ち出し直後は0.08秒）までは探し続ける
-      if((t-last.tm)/slow>(pts.length>2?0.12:0.08)) break; }
+    if(pick){ pts.push({x:pick.x,y:pick.y,tm:t,tent:!!fam}); miss=0; wasHidden=false; unseen.length=0; }
+    else { miss++;
+      // 見失っても探し続ける時間：体の後ろに隠れている間は0.5秒、それ以外は0.12秒（打ち出し直後は0.08秒）
+      if(pts.length>=2&&unseen.length<20) unseen.push(r4(t));
+      if(hidden){ hiddenSteps++; wasHidden=true; } // 一度体の後ろに入ったら、見つかるまでは「隠れている」とみなす（服は骨格より太いため）
+      const limit=(hidden||wasHidden)&&pts.length>=2?0.5:(pts.length>=2?0.12:0.08);
+      if((t-last.tm)/slow>limit) break; }
     const tmp=prev; prev=cur; cur=tmp;
   }
   log(`ボール追跡: ${pts.length-1}点を追跡（読んだコマ ${iter}、同じコマ ${dup}）`);
-  if(pts.length<3) return null;
-  return pts.map(q=>({x:r4(q.x/W),y:r4(q.y/H),tm:r4(q.tm)}));
+  // 体の後ろから出てきたところで見つけ直した点は、その後に2点以上続いていなければ誤検出として捨てる
+  let clean=pts.slice(); { let k=clean.findIndex(q=>q.tent); while(k>=0){ const after=clean.length-1-k; if(after<2){ clean=clean.slice(0,k); break; } k=clean.findIndex((q,i)=>i>k&&q.tent); } }
+  // 追跡した点のうち、前後の流れから大きく外れた点（誤検出）を取り除く
+  for(let pass=0;pass<2&&clean.length>=6;pass++){
+    const res2=clean.map((q,i)=>{ if(i===0||i===clean.length-1) return 0; const a=clean[i-1], b=clean[i+1], tt=(q.tm-a.tm)/Math.max(1e-6,b.tm-a.tm); return Math.hypot(q.x-(a.x+(b.x-a.x)*tt),q.y-(a.y+(b.y-a.y)*tt)); });
+    const med=median(res2.filter(v=>v>0))||1; const keep=clean.filter((q,i)=>res2[i]<=Math.max(med*4,dBall*1.5));
+    if(keep.length===clean.length) break; clean=keep; }
+  log(`ボール追跡: 体と重なって除外した点 ${bodyRej}、体に隠れて探し続けたコマ ${hiddenSteps}、隠れた後に見つけ直した回数 ${reacq}、外れ値として除いた点 ${pts.length-clean.length}`);
+  const pts2=clean;
+  if(pts2.length<3) return null;
+  const outPts=pts2.map(q=>({x:r4(q.x/W),y:r4(q.y/H),tm:r4(q.tm)})); outPts.unseen=wasHidden?unseen.slice():[]; return outPts;
 }
 
 // ---------- ログ・タイムアウト ----------
@@ -775,7 +857,7 @@ function renderResult(){
   $('mHand').innerHTML=`${fmt(r.speed.hand,1)}<small>m/s</small>`;
   $('mTempo').innerHTML=`${fmt(r.tempo,1)}<small>：1</small>`;
   $('mTracer').textContent=rec.tracer.kind==='detected'?'検出＋予測':'予測ライン';
-  $('mTracerS').textContent=(rec.tracer.kind==='detected'?`実線＝追跡できた${rec.tracer.pts.length-1}コマ、点線＝その先の予測`:'ボールを追えなかったため、点線の予測で表示')+(rec.meta.view==='dtl'?'・落下地点まで表示':'・落下地点は下の弾道図で表示');
+  $('mTracerS').textContent=(rec.tracer.kind==='detected'?`実線＝追跡できた${rec.tracer.pts.length-1}コマ、点線＝その先の予測${rec.tracer.unseen&&rec.tracer.unseen.length?'（体に隠れて見えなかった区間も含めて予測）':''}`:'ボールを追えなかったため、点線の予測で表示')+(rec.meta.view==='dtl'?'・落下地点まで表示':'・落下地点は下の弾道図で表示');
   renderFlight(rec);
   const ph=$('phases'); ph.innerHTML='';
   for(const [k,l] of Object.entries(PHASE_LABEL)){ const b=document.createElement('button'); b.type='button'; b.innerHTML=`${l}<b>${fmt(rec.frames[r.phases[k]].tr,2)}秒</b>`; b.addEventListener('click',()=>{stopPlay();gotoIdx(r.phases[k]);}); ph.appendChild(b); }
@@ -878,7 +960,7 @@ async function fixBall(b){
   try{
     rec.ball=b; let tpts=null;
     if(S.mode==='video'){ try{ tpts=await trackBall(vid,rec.frames,rec.res,rec.meta,b); }catch(e){} await seek(vid,rec.frames[S.cur].tm); }
-    rec.tracer=tpts?{kind:'detected',pts:tpts}:{kind:'estimated',pts:estTracer(b,rec.meta)};
+    rec.tracer=tpts?{kind:'detected',pts:tpts,unseen:tpts.unseen||[]}:{kind:'estimated',pts:estTracer(b,rec.meta)};
     await dbPut(rec); renderResult(); renderHistory(); $('status').textContent='ボール位置を直しました';
   } finally { S.busy=false; draw(); }
 }
@@ -927,7 +1009,7 @@ $('run').addEventListener('click',async()=>{
     if(!ball) ball=defaultBall(frames,meta,res.phases.address);
     $('status').textContent='ボールを追跡しています…';
     let tpts=null; try{ tpts=await trackBall(vid,frames,res,meta,ball); }catch(e){}
-    const tracer=tpts?{kind:'detected',pts:tpts}:{kind:'estimated',pts:estTracer(ball,meta)};
+    const tracer=tpts?{kind:'detected',pts:tpts,unseen:tpts.unseen||[]}:{kind:'estimated',pts:estTracer(ball,meta)};
     await seek(vid,frames[res.phases.address].tm);
     const tc=document.createElement('canvas'); tc.width=360; tc.height=Math.round(360*meta.vh/meta.vw); tc.getContext('2d').drawImage(vid,0,0,tc.width,tc.height);
     const rec={id:Date.now(),date:Date.now(),meta,frames,res,ball,tracer,thumb:tc.toDataURL('image/jpeg',0.72),video:S.video.file||null};
