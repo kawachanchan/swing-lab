@@ -231,7 +231,7 @@ const KEYS=['nose','ls','rs','le','re','lw','rw','lh','rh','lk','rk','la','ra'];
 const MP_IDX=[0,11,12,13,14,15,16,23,24,25,26,27,28];
 const KI=Object.fromEntries(KEYS.map((k,i)=>[k,i]));
 const EDGES=[['ls','rs'],['ls','le'],['le','lw'],['rs','re'],['re','rw'],['ls','lh'],['rs','rh'],['lh','rh'],['lh','lk'],['lk','la'],['rh','rk'],['rk','ra']];
-const MAX_FRAMES=360, KEEP=5, HEAD_FACTOR=4.5;
+const MAX_FRAMES=360, KEEP=5;
 const PHASE_LABEL={address:'アドレス',top:'トップ',impact:'インパクト',finish:'フィニッシュ'};
 const $=id=>document.getElementById(id);
 
@@ -313,16 +313,47 @@ function analyze(frames, meta){
   // スピード
   const f0=frames[address], body=dist(pt(f0,'nose'),mid(pt(f0,'la'),pt(f0,'ra')));
   const mpp=(meta.heightCm/100*0.88)/(body||1);
-  let peak=0; for(let i=top+1;i<=Math.min(n-1,impact+2);i++) peak=Math.max(peak,sp[i]);
-  const hand=peak*mpp, head=hand*HEAD_FACTOR;
   const realFps=(n-1)/Math.max(1e-3,frames[n-1].tr-frames[0].tr);
+  const sd=handSpeed(frames,raw,mpp,top,impact,realFps);
+  const hand=sd.hand, head=hand*clubFactor(meta.club);
   const notes=[];
+  if(sd.capped) notes.push('手元の速さが人の限界を超える値になったため、上限値に抑えました。骨格の検出が乱れている可能性があります。');
+  const cr=CLUB_RANGE[meta.club||'D'];
+  if(cr&&(head<cr[0]||head>cr[1])) notes.push(`推定ヘッドスピード（${fmt(head,1)}m/s）が${(CLUBS[meta.club||'D']||CLUBS.D).name}の一般的な範囲（${cr[0]}〜${cr[1]}m/s）から外れています。設定の「使ったクラブ」「身長」「動画の速さ」が正しいか確認してください。`);
   if(realFps<100) notes.push(`実際の撮影時間で1秒あたり約${Math.round(realFps)}コマで解析しました。ダウンスイングは一瞬なので、スピードは実際より低く出やすくなります。スロー撮影がおすすめです。`);
   if(meta.view==='dtl') notes.push('後方から撮影した動画では、肩の回転は採点に含めていません。');
-  return {phases:{address,start,top,impact,finish},items,total,speed:{hand,head},tempo:ratio,notes,torso};
+  return {phases:{address,start,top,impact,finish},items,total,speed:{hand,head,peakIdx:sd.peakIdx,glitches:sd.glitches},tempo:ratio,notes,torso};
+}
+
+// ---------- 手元の速さ（外れ値を除いて安定させる） ----------
+function handSpeed(frames,raw,mpp,top,impact,realFps){
+  const n=frames.length, vis=frames.map(f=>Math.min(f.p[KI.lw][2],f.p[KI.rw][2]));
+  const pts=raw.map(h=>({x:h.x,y:h.y})), ok=pts.map((_,i)=>vis[i]>=0.4);
+  // 1コマで人の手ではありえない距離（秒速20m相当以上）を飛んだ点は検出ミスとして除く
+  let glitches=0, last=-1;
+  for(let i=0;i<n;i++){ if(!ok[i]) continue; if(last>=0){ const dt=Math.max(1e-3,frames[i].tr-frames[last].tr); if(dist(pts[i],pts[last])*mpp/dt>20){ ok[i]=false; glitches++; continue; } } last=i; }
+  // 除いた点は前後から補間
+  for(let i=0;i<n;i++){ if(ok[i]) continue; let a=i-1; while(a>=0&&!ok[a]) a--; let b=i+1; while(b<n&&!ok[b]) b++;
+    if(a>=0&&b<n){ const t=(frames[i].tr-frames[a].tr)/Math.max(1e-6,frames[b].tr-frames[a].tr); pts[i]={x:pts[a].x+(pts[b].x-pts[a].x)*t,y:pts[a].y+(pts[b].y-pts[a].y)*t}; } else if(a>=0) pts[i]={...pts[a]}; else if(b<n) pts[i]={...pts[b]}; }
+  // なめらかにする（コマが細かいほど広い範囲で平均）
+  const w=realFps>150?2:realFps>80?1:0;
+  const sm=pts.map((_,i)=>{ let x=0,y=0,c=0; for(let j=i-w;j<=i+w;j++){ if(j>=0&&j<n){ const k=w+1-Math.abs(j-i); x+=pts[j].x*k; y+=pts[j].y*k; c+=k; } } return {x:x/c,y:y/c}; });
+  // 前後のコマから速さを計算し、ダウンスイング中の上位3つの中央値を最大速度とする（1コマだけの跳ねに引っ張られないように）
+  const v=[]; for(let i=Math.max(1,top);i<=Math.min(n-2,impact+1);i++){ const dt=Math.max(1e-6,frames[i+1].tr-frames[i-1].tr); v.push({i,s:dist(sm[i+1],sm[i-1])*mpp/dt}); }
+  v.sort((a,b)=>b.s-a.s);
+  let hand=v.length>=3?v[1].s:(v[0]?v[0].s:0), peakIdx=v[0]?v[0].i:impact, capped=false;
+  if(hand>13){ hand=13; capped=true; }
+  log(`速度計算: 実コマ数 ${Math.round(realFps)}/秒、除外した点 ${glitches}、上位の速さ ${v.slice(0,3).map(o=>o.s.toFixed(1)).join(', ')} m/s、1pxあたり ${(mpp*1000).toFixed(2)}mm`);
+  return {hand,peakIdx,glitches,capped};
 }
 
 // ---------- 推定飛距離 ----------
+// 手元の速さ→ヘッドスピードの倍率。クラブが長いほど大きい
+const CLUB_FACTOR={D:4.5,W3:4.35,UT:4.15,I5:4.0,I7:3.85,I9:3.7,PW:3.6};
+function clubFactor(c){ return CLUB_FACTOR[c]||CLUB_FACTOR.D; }
+// クラブごとの一般的なヘッドスピードの範囲（m/s）。これを外れたら注意を出す
+const CLUB_RANGE={D:[28,55],W3:[27,52],UT:[25,48],I5:[24,46],I7:[23,44],I9:[22,41],PW:[21,39]};
+function headOf(res,club){ return res.speed.hand*clubFactor(club); }
 // k：芯で当たったときの「ヘッドスピード1m/sあたりのヤード数」の目安
 const CLUBS={D:{name:'ドライバー',k:5.3},W3:{name:'3番ウッド',k:5.0},UT:{name:'ユーティリティ',k:4.6},I5:{name:'5番アイアン',k:4.5},I7:{name:'7番アイアン',k:4.2},I9:{name:'9番アイアン',k:3.8},PW:{name:'ピッチングウェッジ',k:3.4}};
 function computeCarry(res,clubKey){
@@ -331,7 +362,7 @@ function computeCarry(res,clubKey){
   // インパクトの質：体軸の維持・頭の安定・テンポから計算（芯を外すほど飛ばなくなる）
   const quality=Math.round(0.4*g('axis')+0.3*g('head')+0.3*g('tempo'));
   const eff=0.8+0.2*quality/100;
-  const yd=res.speed.head*c.k*eff;
+  const yd=headOf(res,clubKey)*c.k*eff;
   return {yd,lo:yd*0.92,hi:yd*1.08,quality,club:c.name};
 }
 
@@ -607,7 +638,7 @@ function renderResult(){
   const cr=computeCarry(r,rec.meta.club||'D');
   $('mCarry').innerHTML=`約${Math.round(cr.yd)}<small>ヤード</small>`;
   $('mCarryS').textContent=`${cr.club}・${Math.round(cr.lo)}〜${Math.round(cr.hi)}yd・インパクトの質 ${cr.quality}点`;
-  $('mHead').innerHTML=`${fmt(r.speed.head,1)}<small>m/s</small>`;
+  $('mHead').innerHTML=`${fmt(headOf(r,rec.meta.club||'D'),1)}<small>m/s</small>`;
   $('mHand').innerHTML=`${fmt(r.speed.hand,1)}<small>m/s</small>`;
   $('mTempo').innerHTML=`${fmt(r.tempo,1)}<small>：1</small>`;
   $('mTracer').textContent=rec.tracer.kind==='detected'?'映像から検出':'推定ライン';
@@ -627,7 +658,7 @@ async function renderHistory(){
   for(const rec of list){
     const li=document.createElement('li'); if(S.rec&&S.rec.id===rec.id) li.className='active';
     const d=new Date(rec.date);
-    li.innerHTML=`<button type="button" class="open"><img alt=""><span class="meta"><b>${rec.res.total} 点</b><div></div><div>推定 約${Math.round(computeCarry(rec.res,rec.meta.club||'D').yd)}ヤード・ヘッドスピード ${fmt(rec.res.speed.head,1)} m/s</div></span></button>`;
+    li.innerHTML=`<button type="button" class="open"><img alt=""><span class="meta"><b>${rec.res.total} 点</b><div></div><div>推定 約${Math.round(computeCarry(rec.res,rec.meta.club||'D').yd)}ヤード・ヘッドスピード ${fmt(headOf(rec.res,rec.meta.club||'D'),1)} m/s</div></span></button>`;
     li.querySelector('img').src=rec.thumb;
     li.querySelector('.meta div').textContent=rec.sample?'サンプル（保存されません）':`${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}・${rec.meta.view==='face'?'正面':'後方'}・${rec.meta.hand==='R'?'右打ち':'左打ち'}`;
     li.querySelector('.open').addEventListener('click',()=>openRecord(rec));
@@ -827,6 +858,8 @@ dbOpen().then(()=>{ openRecord(SAMPLE); });
 // ページを開いたら裏で解析エンジンを準備しておく（「解析する」を押したときの待ち時間をなくす）
 setTimeout(()=>{ getLandmarker(settings().cx).catch(()=>{}); },600);
 $('cx').addEventListener('change',()=>{ getLandmarker(settings().cx).catch(()=>{}); });
+// 解析後にクラブを選び直したら、表示中の記録のクラブも直して再計算する
+$('club').addEventListener('change',()=>{ const r=S.rec; if(!r||r.sample||S.busy) return; r.meta.club=$('club').value; dbPut(r); renderResult(); renderHistory(); $('status').textContent=`クラブを「${(CLUBS[r.meta.club]||CLUBS.D).name}」に変えて計算し直しました`; });
 })();
 </script>
 
