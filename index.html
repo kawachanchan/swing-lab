@@ -109,6 +109,7 @@ details.tips ul{margin:8px 0 0;padding-left:1.2em}
 .hist .meta div{font-size:12px;color:var(--muted)}
 .hist .open{flex:1;display:flex;gap:12px;align-items:center;text-align:left;background:none;border:0;color:inherit;font:inherit;cursor:pointer;padding:0;min-width:0}
 .empty{font-size:13px;color:var(--muted)}
+pre.log{white-space:pre-wrap;word-break:break-all;font-size:11px;max-height:220px;overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:8px;margin:8px 0;color:var(--ink)}
 footer{font-size:12px;color:var(--muted);text-align:center}
 @media (prefers-reduced-motion: reduce){ .progress div{transition:none} }
 </style>
@@ -144,7 +145,7 @@ footer{font-size:12px;color:var(--muted);text-align:center}
         <select id="club"><option value="D" selected>ドライバー</option><option value="W3">3番ウッド</option><option value="UT">ユーティリティ</option><option value="I5">5番アイアン</option><option value="I7">7番アイアン</option><option value="I9">9番アイアン</option><option value="PW">ピッチングウェッジ</option></select>
       </label>
       <label class="field" for="cx">骨格検出の精度
-        <select id="cx"><option value="0">標準（速い）</option><option value="1" selected>高（少し遅い）</option></select>
+        <select id="cx"><option value="0" selected>標準（速い）</option><option value="1">高（遅い）</option></select>
       </label>
     </div>
     <details class="tips">
@@ -180,9 +181,15 @@ footer{font-size:12px;color:var(--muted);text-align:center}
     <p class="hint" id="hint">いまは練習用のサンプルを表示しています。「動画を選ぶ」から自分のスイング動画を読み込んでください。</p>
     <div class="row">
       <button class="btn primary" id="run" type="button" disabled>解析する</button>
+      <button class="btn ghost" id="cancel" type="button" hidden>中止</button>
       <div class="progress" id="prog" hidden><div id="progBar"></div></div>
       <span class="muted" id="status" role="status"></span>
     </div>
+    <details class="tips" id="logBox">
+      <summary>詳細ログ（うまく動かないときは、これをコピーして送ってください）</summary>
+      <pre id="log" class="log"></pre>
+      <button class="btn ghost" id="copyLog" type="button">ログをコピー</button>
+    </details>
   </section>
 
   <section class="card" aria-labelledby="h-res">
@@ -381,12 +388,26 @@ async function trackBall(video, frames, res, meta, ball){
   return pts.map(p=>({x:p.x/sw,y:p.y/sh}));
 }
 
+// ---------- ログ・タイムアウト ----------
+const LOG=[];
+function log(m){ LOG.push(`${(performance.now()/1000).toFixed(1)}s ${m}`); if(LOG.length>300) LOG.shift(); const el=document.getElementById('log'); if(el) el.textContent=LOG.join('\n'); }
+function withTimeout(pr,ms,msg){ let to; return Promise.race([pr,new Promise((_,rej)=>{to=setTimeout(()=>rej(new Error(msg)),ms);})]).finally(()=>clearTimeout(to)); }
+const nextFrame=()=>new Promise(r=>requestAnimationFrame(()=>r()));
+window.addEventListener('error',e=>log('エラー: '+e.message));
+window.addEventListener('unhandledrejection',e=>log('エラー: '+(e.reason&&e.reason.message||e.reason)));
+
 // ---------- 骨格検出（MediaPipe Pose） ----------
 let pose=null, poseCx=null, lastRes=null;
 function loadScript(src){ return new Promise((res,rej)=>{ const sc=document.createElement('script'); sc.src=src; sc.onload=res; sc.onerror=()=>rej(new Error('解析エンジンのファイルを読み込めませんでした。通信環境を確認してください。')); document.head.appendChild(sc); }); }
+async function checkFiles(list){
+  const miss=[];
+  for(const f of list){ try{ const r=await fetch('mp/'+f,{method:'HEAD',cache:'no-store'}); if(r.status===404) miss.push(f); }catch(e){} }
+  if(miss.length){ log('見つからないファイル: '+miss.join(', ')); const er=new Error(`mpフォルダに必要なファイルがありません（${miss.join('、')}）。GitHubに mp フォルダの中身がすべてアップロードされているか確認してください。`); er.missing=true; throw er; }
+}
 async function resolveAssets(cx){
   // mp/ に元のファイルがあればそのまま使う。無い環境では埋め込み版（Base64）から読み込む
-  try{ const r=await fetch('mp/pose_web.binarypb',{cache:'no-store'}); const ct=r.headers.get('content-type')||''; if(r.ok&&!/html/.test(ct)) return {}; }catch(e){}
+  try{ const r=await fetch('mp/pose_web.binarypb',{cache:'no-store'}); const ct=r.headers.get('content-type')||''; if(r.ok&&!/html/.test(ct)){ await checkFiles(['pose_solution_packed_assets_loader.js','pose_solution_simd_wasm_bin.js','pose_solution_simd_wasm_bin.wasm','pose_solution_wasm_bin.js','pose_solution_wasm_bin.wasm','pose_solution_packed_assets.data',cx?'pose_landmark_full.tflite':'pose_landmark_lite.tflite']); log('モデル: mpフォルダのファイルを使用'); return {}; } }catch(e){ if(e&&e.missing) throw e; }
+  log('モデル: 埋め込み版を使用');
   const need=['pose_solution_packed_assets.data','pose_web.binarypb',cx?'pose_landmark_full.tflite':'pose_landmark_lite.tflite'], map={};
   for(const f of need){ await loadScript('mp/b64/'+f.replace(/\./g,'_')+'.js'); const b=atob(window.__MPB[f]); const u=new Uint8Array(b.length); for(let i=0;i<b.length;i++) u[i]=b.charCodeAt(i); map[f]=URL.createObjectURL(new Blob([u])); delete window.__MPB[f]; }
   return map;
@@ -399,16 +420,19 @@ async function getPose(cx){
   pose=new Pose({locateFile:f=>assets[f]||('mp/'+f)});
   pose.setOptions({modelComplexity:cx,smoothLandmarks:true,enableSegmentation:false,minDetectionConfidence:0.5,minTrackingConfidence:0.5});
   pose.onResults(r=>{lastRes=r;});
-  await pose.initialize(); poseCx=cx; return pose;
+  log('解析エンジンを初期化中');
+  try{ await withTimeout(pose.initialize(),90000,'解析エンジンの準備が90秒たっても終わりませんでした。通信環境のよい場所でページを再読み込みしてください。'); }
+  catch(e){ try{pose.close();}catch(_){} pose=null; poseCx=null; throw e; }
+  log('解析エンジンの準備完了'); poseCx=cx; return pose;
 }
 function seek(v,t){
   return new Promise(res=>{
     if(Math.abs(v.currentTime-t)<1e-4) t+=1e-3;
     let done=false; const fin=()=>{if(!done){done=true;res();}};
     const on=()=>{ v.removeEventListener('seeked',on);
-      if(v.requestVideoFrameCallback){ const to=setTimeout(fin,120); v.requestVideoFrameCallback(()=>{clearTimeout(to);fin();}); } else setTimeout(fin,40); };
+      requestAnimationFrame(()=>fin()); };
     v.addEventListener('seeked',on); v.currentTime=Math.min(t,Math.max(0,v.duration-1e-3));
-    setTimeout(()=>{v.removeEventListener('seeked',on);fin();},3000);
+    setTimeout(()=>{ if(!done){ v.removeEventListener('seeked',on); S.seekTimeouts=(S.seekTimeouts||0)+1; fin(); } },3000);
   });
 }
 
@@ -602,23 +626,37 @@ ov.addEventListener('click',e=>{ if(S.mode!=='video'||S.busy||!vid.src||S.rec) r
 
 // ---------- 解析 ----------
 $('run').addEventListener('click',async()=>{
-  if(S.busy||!vid.src) return; stopPlay(); S.busy=true;
+  if(S.busy||!vid.src) return; stopPlay();
+  // iPhoneでは、ボタンを押した直後に再生しておかないと動画のコマが読み込まれないことがある
+  try{ const pr=vid.play(); if(pr&&pr.then) pr.then(()=>vid.pause()).catch(()=>{}); }catch(e){}
+  S.busy=true; S.cancel=false; S.seekTimeouts=0; LOG.length=0;
+  log(`端末: ${navigator.userAgent}`); log(`動画: ${vid.videoWidth}x${vid.videoHeight} 長さ${fmt(vid.duration,2)}秒 readyState=${vid.readyState}`);
   const s=settings(), [t0,t1]=S.video.range; const meta={vw:vid.videoWidth,vh:vid.videoHeight,hand:s.hand,view:s.view,heightCm:s.heightCm,fps:s.fps,slow:s.slow,club:s.club};
-  const btns=['run','setStart','setEnd','play','file']; btns.forEach(b=>$(b).disabled=true);
+  const btns=['run','setStart','setEnd','play','file']; btns.forEach(b=>$(b).disabled=true); $('cancel').hidden=false;
   $('prog').hidden=false; $('progBar').style.width='0%';
   try{
     $('status').textContent='解析エンジンを準備しています（初回は数十秒かかることがあります）…';
     const p=await getPose(s.cx);
+    if(vid.readyState<2){ log('動画のデータを読み込み待ち'); await withTimeout(new Promise(r=>{ if(vid.readyState>=2) return r(); vid.addEventListener('loadeddata',()=>r(),{once:true}); try{vid.load();}catch(e){} }),15000,'動画を読み込めませんでした。別の動画で試すか、ページを再読み込みしてください。'); }
+    // 大きい動画（4Kなど）はそのまま渡すと重いので、縮小したキャンバスに描いてから解析する
+    const sc=Math.min(1,640/Math.max(meta.vw,meta.vh)), fc=document.createElement('canvas'); fc.width=Math.round(meta.vw*sc); fc.height=Math.round(meta.vh*sc); const fctx=fc.getContext('2d');
+    log(`解析用の画像サイズ: ${fc.width}x${fc.height}`);
     let st=1/s.fps, count=Math.floor((t1-t0)/st)+1, capped=false;
     if(count>MAX_FRAMES){ st=(t1-t0)/(MAX_FRAMES-1); count=MAX_FRAMES; capped=true; }
     const frames=[]; let ok=0;
     for(let i=0;i<count;i++){
-      const tm=t0+i*st; await seek(vid,tm); lastRes=null; await p.send({image:vid});
+      if(S.cancel) throw new Error('解析を中止しました。');
+      const tm=t0+i*st, ta=performance.now(); await seek(vid,tm); const tb=performance.now();
+      fctx.drawImage(vid,0,0,fc.width,fc.height); lastRes=null;
+      await withTimeout(p.send({image:fc}),20000,'骨格の検出が止まってしまいました。「骨格検出の精度」を「標準」にするか、ページを再読み込みしてもう一度試してください。');
+      if(i<3||i%30===0) log(`コマ${i+1}: 移動${Math.round(tb-ta)}ms 検出${Math.round(performance.now()-tb)}ms 人物${lastRes&&lastRes.poseLandmarks?'あり':'なし'}`);
       const lm=lastRes&&lastRes.poseLandmarks;
       frames.push({tm:r4(tm),tr:r4((tm-t0)/s.slow),p:lm?MP_IDX.map(j=>[r4(lm[j].x),r4(lm[j].y),Math.round((lm[j].visibility??1)*100)/100]):null});
       if(lm) ok++;
       $('progBar').style.width=`${Math.round((i+1)/count*90)}%`; $('status').textContent=`骨格を検出中 ${i+1} / ${count} コマ`;
+      if(i%5===4) await nextFrame();
     }
+    log(`検出完了: 人物を検出できたコマ ${ok}/${count}、動画の移動待ちタイムアウト ${S.seekTimeouts}回`);
     if(ok<count*0.6) throw new Error('体を検出できないコマが多すぎました。全身が映るように撮影し、明るい場所で試してください。');
     // 検出できなかったコマを前後のコマで補う
     let lastP=frames.find(f=>f.p).p; for(const f of frames){ if(f.p) lastP=f.p; else f.p=lastP; }
@@ -638,10 +676,15 @@ $('run').addEventListener('click',async()=>{
     $('hint').textContent='「再生」を押すと0.5倍速で骨格と弾道ラインを重ねて再生します。結果の局面ボタンで各場面に移動できます。';
   }catch(err){
     $('status').textContent=err&&err.message?err.message:'解析に失敗しました。別の動画で試してください。';
+    log('停止: '+(err&&err.message||err)); if(!S.cancel) $('logBox').open=true;
   }finally{
-    S.busy=false; btns.forEach(b=>$(b).disabled=false); setTimeout(()=>{$('prog').hidden=true;},800);
+    S.busy=false; btns.forEach(b=>$(b).disabled=false); $('cancel').hidden=true; setTimeout(()=>{$('prog').hidden=true;},800);
   }
 });
+
+$('cancel').addEventListener('click',()=>{ S.cancel=true; $('status').textContent='中止しています…'; });
+$('copyLog').addEventListener('click',()=>{ const t=LOG.join('\n')||'（ログはまだありません）'; try{ navigator.clipboard.writeText(t).then(()=>{$('copyLog').textContent='コピーしました';},()=>selectLog()); }catch(e){ selectLog(); } });
+function selectLog(){ const r=document.createRange(); r.selectNodeContents($('log')); const sel=getSelection(); sel.removeAllRanges(); sel.addRange(r); $('copyLog').textContent='選択しました。長押しでコピーしてください'; }
 
 // ---------- サンプルデータ（合成したスイング） ----------
 function makeSample(){
