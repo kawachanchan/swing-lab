@@ -77,6 +77,7 @@ details.tips ul{margin:8px 0 0;padding-left:1.2em}
 .progress div{height:100%;width:0;background:var(--accent);transition:width .15s}
 .badge{font-size:12px;padding:2px 8px;border-radius:99px;background:var(--surface-2);color:var(--muted);white-space:nowrap}
 .badge.ok{background:var(--accent);color:var(--accent-ink)}
+.badge.err{background:var(--bad);color:var(--surface)}
 .badge.sample{background:var(--warn);color:var(--surface)}
 .score-head{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
 .total{display:flex;align-items:baseline;gap:4px}
@@ -437,39 +438,65 @@ window.addEventListener('unhandledrejection',e=>log('エラー: '+(e.reason&&e.r
 // ---------- 骨格検出（MediaPipe Tasks：PoseLandmarker） ----------
 let landmarker=null, lmCx=null, lmLoading=null, tsCounter=0;
 function loadScript(src){ return new Promise((res,rej)=>{ const sc=document.createElement('script'); sc.src=src; sc.onload=res; sc.onerror=()=>rej(new Error('解析エンジンのファイルを読み込めませんでした。通信環境を確認してください。')); document.head.appendChild(sc); }); }
+// タイムアウト付きfetch（応答が返らないまま止まるのを防ぐ）
+async function fetchT(url,opt,ms){ const ac=new AbortController(); const to=setTimeout(()=>ac.abort(),ms); try{ return await fetch(url,{...(opt||{}),signal:ac.signal}); } finally{ clearTimeout(to); } }
 async function checkFiles(list){
   const miss=[];
-  for(const f of list){ try{ const r=await fetch('mp2/'+f,{method:'HEAD',cache:'no-store'}); if(r.status===404) miss.push(f); }catch(e){} }
+  for(const f of list){ try{ const r=await fetchT('mp2/'+f,{method:'HEAD',cache:'no-store'},8000); if(r.status===404) miss.push(f); }catch(e){ log(`確認できず（${e.name==='AbortError'?'応答なし':e.message}）: ${f}`); } }
   if(miss.length){ log('見つからないファイル: '+miss.join(', ')); const er=new Error(`mp2フォルダに必要なファイルがありません（${miss.join('、')}）。GitHubに mp2 フォルダの中身がすべてアップロードされているか確認してください。`); er.missing=true; throw er; }
 }
+// 進捗つきダウンロード。20秒データが届かなければ打ち切る
+async function download(url,label){
+  const ac=new AbortController(); let idle=setTimeout(()=>ac.abort(),20000);
+  try{
+    const r=await fetch(url,{signal:ac.signal});
+    if(!r.ok) throw new Error(r.status===404?`${label}のファイルが見つかりません（${url}）。GitHubに mp2 フォルダの中身がすべてアップロードされているか確認してください。`:`${label}を取得できませんでした（HTTP ${r.status}）`);
+    if(/html/.test(r.headers.get('content-type')||'')) throw new Error(`${label}が見つかりません`);
+    const total=+r.headers.get('content-length')||0;
+    if(!r.body||!r.body.getReader){ const buf=new Uint8Array(await r.arrayBuffer()); return buf; }
+    const rd=r.body.getReader(), parts=[]; let got=0, lastLog=0;
+    for(;;){ const {done,value}=await rd.read(); if(done) break; parts.push(value); got+=value.length;
+      clearTimeout(idle); idle=setTimeout(()=>ac.abort(),20000);
+      const pct=total?Math.round(got/total*100):null; setEngine('loading',`${label} ${pct!=null?pct+'%':(got/1048576).toFixed(1)+'MB'}`);
+      if(performance.now()-lastLog>3000){ lastLog=performance.now(); log(`${label} 受信中 ${(got/1048576).toFixed(1)}MB${total?` / ${(total/1048576).toFixed(1)}MB`:''}`); } }
+    const out=new Uint8Array(got); let o=0; for(const part of parts){ out.set(part,o); o+=part.length; }
+    log(`${label} 受信完了 ${(got/1048576).toFixed(1)}MB`); return out;
+  }catch(e){ if(e.name==='AbortError') throw new Error(`${label}のダウンロードが20秒以上止まりました。通信環境を確認してページを再読み込みしてください。`); throw e; }
+  finally{ clearTimeout(idle); }
+}
 async function modelSource(cx){
-  // mp2/ にモデルファイルがあればそのまま使う。無い環境では埋め込み版（Base64）から読み込む
+  // mp2/ にモデルファイルがあればダウンロードして使う。無い環境では埋め込み版（Base64）から読み込む
   const name=cx?'pose_landmarker_full.task':'pose_landmarker_lite.task';
-  try{ const r=await fetch('mp2/'+name,{method:'HEAD',cache:'no-store'}); const ct=r.headers.get('content-type')||''; if(r.ok&&!/html/.test(ct)){ log('モデル: mp2フォルダのファイルを使用'); return {modelAssetPath:'mp2/'+name}; } }catch(e){}
-  log('モデル: 埋め込み版を使用');
-  await loadScript('mp2/b64/'+name.replace(/\./g,'_')+'.js');
+  try{ const u=await download('mp2/'+name,'モデル'); log('モデル: mp2フォルダのファイルを使用'); return {modelAssetBuffer:u}; }
+  catch(e){ log('mp2のモデルを使えません: '+e.message); if(/止まりました/.test(e.message)) throw e; }
+  log('モデル: 埋め込み版を使用'); setEngine('loading','モデル（埋め込み版）');
+  await withTimeout(loadScript('mp2/b64/'+name.replace(/\./g,'_')+'.js'),60000,'モデルを読み込めませんでした。');
   const b=atob(window.__MPB[name]); const u=new Uint8Array(b.length); for(let i=0;i<b.length;i++) u[i]=b.charCodeAt(i); delete window.__MPB[name];
   return {modelAssetBuffer:u};
 }
-function setEngine(state){ const e=document.getElementById('engine'); if(!e) return; e.textContent=state==='ready'?'解析エンジン 準備OK':state==='error'?'解析エンジン エラー':'解析エンジン 準備中…'; e.className='badge'+(state==='ready'?' ok':''); }
+function setEngine(state,detail){ const e=document.getElementById('engine'); if(!e) return; e.textContent=state==='ready'?'解析エンジン 準備OK':state==='error'?'解析エンジン エラー':`解析エンジン 準備中${detail?'（'+detail+'）':'…'}`; e.className='badge'+(state==='ready'?' ok':state==='error'?' err':''); }
 async function getLandmarker(cx){
-  if(typeof Vision==='undefined') throw new Error('解析エンジン（MediaPipe）を読み込めませんでした。ページを再読み込みしてください。');
+  if(typeof Vision==='undefined') throw new Error('解析エンジン（mp2/vision_bundle.js）を読み込めませんでした。mp2フォルダがアップロードされているか確認し、ページを再読み込みしてください。');
   if(landmarker&&lmCx===cx) return landmarker;
   if(!lmLoading||lmLoading.cx!==cx){
     setEngine('loading');
     const job=(async()=>{
-      const t0=performance.now(); log('解析エンジンを準備中');
-      await checkFiles(['wasm/vision_wasm_internal.js','wasm/vision_wasm_internal.wasm']);
-      const fs=await Vision.FilesetResolver.forVisionTasks('mp2/wasm');
-      const src=await modelSource(cx);
-      const lm=await Vision.PoseLandmarker.createFromOptions(fs,{baseOptions:{...src,delegate:'CPU'},runningMode:'VIDEO',numPoses:1,minPoseDetectionConfidence:0.5,minPosePresenceConfidence:0.5,minTrackingConfidence:0.5});
+      const t0=performance.now(); log(`解析エンジンを準備中（端末: ${navigator.userAgent}）`);
+      const simd=await Vision.FilesetResolver.isSimdSupported();
+      const base=simd?'vision_wasm_internal':'vision_wasm_nosimd_internal'; log(`1/3 エンジン取得（${simd?'SIMD対応':'SIMD非対応'}）`);
+      // 先に進捗つきで取得しておく（ブラウザのキャッシュに入るので、エンジン起動時の読み込みが速くなる）
+      await download(`mp2/wasm/${base}.wasm`,'エンジン');
+      const fs={wasmLoaderPath:new URL(`mp2/wasm/${base}.js`,location.href).href,wasmBinaryPath:new URL(`mp2/wasm/${base}.wasm`,location.href).href};
+      log('2/3 モデル取得'); const src=await modelSource(cx);
+      log('3/3 エンジン起動'); setEngine('loading','起動中');
+      const lm=await withTimeout(Vision.PoseLandmarker.createFromOptions(fs,{baseOptions:{...src,delegate:'CPU'},runningMode:'VIDEO',numPoses:1,minPoseDetectionConfidence:0.5,minPosePresenceConfidence:0.5,minTrackingConfidence:0.5}),45000,'解析エンジンの起動が45秒たっても終わりませんでした（ダウンロードは完了しています）。「詳細ログ」をコピーして送ってください。');
       if(landmarker){ try{landmarker.close();}catch(e){} }
       landmarker=lm; lmCx=cx; log(`解析エンジンの準備完了（${((performance.now()-t0)/1000).toFixed(1)}秒）`); setEngine('ready'); return lm;
     })();
     lmLoading={cx,job};
-    job.catch(e=>{ log('エンジン準備エラー: '+(e&&e.message||e)); setEngine('error'); if(lmLoading&&lmLoading.job===job) lmLoading=null; });
+    job.catch(e=>{ log('エンジン準備エラー: '+(e&&e.message||e)); setEngine('error'); if(lmLoading&&lmLoading.job===job) lmLoading=null; const lb=document.getElementById('logBox'); if(lb) lb.open=true; const st=document.getElementById('status'); if(st&&!S.busy) st.textContent=e&&e.message||'解析エンジンを準備できませんでした'; });
   }
-  return withTimeout(lmLoading.job,90000,'解析エンジンの準備が90秒たっても終わりませんでした。通信環境のよい場所でページを再読み込みしてください。');
+  return lmLoading.job;
 }
 function seek(v,t){
   return new Promise(res=>{
@@ -697,7 +724,7 @@ $('run').addEventListener('click',async()=>{
   if(S.busy||!vid.src) return; stopPlay();
   // iPhoneでは、ボタンを押した直後に再生しておかないと動画のコマが読み込まれないことがある
   try{ const pr=vid.play(); if(pr&&pr.then) pr.then(()=>vid.pause()).catch(()=>{}); }catch(e){}
-  S.busy=true; S.cancel=false; S.seekTimeouts=0; LOG.length=0;
+  S.busy=true; S.cancel=false; S.seekTimeouts=0; log('---- 解析開始 ----');
   log(`端末: ${navigator.userAgent}`); log(`動画: ${vid.videoWidth}x${vid.videoHeight} 長さ${fmt(vid.duration,2)}秒 readyState=${vid.readyState}`);
   const s=settings(), [t0,t1]=S.video.range; const meta={vw:vid.videoWidth,vh:vid.videoHeight,hand:s.hand,view:s.view,heightCm:s.heightCm,fps:s.fps,slow:s.slow,club:s.club};
   const btns=['run','setStart','setEnd','play','file']; btns.forEach(b=>$(b).disabled=true); $('cancel').hidden=false;
